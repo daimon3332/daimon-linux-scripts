@@ -30,7 +30,7 @@ validate_config_name() {
 
 openclaw_read_import_path() {
 	local prompt="${1:-请输入备份包路径}" path
-	read -e -p "$prompt（输入 0 取消）: " path
+	read -e -p "$prompt（输入 0 取消）: " path || return 1
 	[ "$path" = "0" ] && return 0
 	path="${path/#\~/$HOME}"
 	if [ -f "$path" ]; then
@@ -215,7 +215,7 @@ daimon_try_download_url() {
 	rm -f "$target" 2>/dev/null || true
 	curl -fsSL --connect-timeout 10 --max-time 60 --retry 2 -o "$target" "$url" 2>/dev/null && [ -s "$target" ] && return 0
 	if command -v wget >/dev/null 2>&1; then
-		wget -qO "$target" "$url" 2>/dev/null && [ -s "$target" ] && return 0
+		timeout 60 wget --timeout=15 --tries=1 -qO "$target" "$url" 2>/dev/null && [ -s "$target" ] && return 0
 	fi
 	return 1
 }
@@ -235,7 +235,18 @@ daimon_validate_update_file() {
 		echo -e "${gl_hong}校验失败：未检测到 linux-tools-daimon 标识${gl_bai}"
 		return 1
 	fi
+	bash -n "$file" || { echo "更新脚本语法校验失败，未安装。"; return 1; }
 	return 0
+}
+
+daimon_install_script_file() {
+	local source="$1" target="$2" staged
+	daimon_validate_update_file "$source" || return 1
+	staged=$(mktemp "${target}.XXXXXX") || return 1
+	if ! command install -m 755 "$source" "$staged" || ! mv -f -- "$staged" "$target"; then
+		rm -f -- "$staged"
+		return 1
+	fi
 }
 
 daimon_download_update_file() {
@@ -405,6 +416,12 @@ yinsiyuanquan2
 
 
 daimon_self_install() {
+	local running
+	running=$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || true)
+	if { [ "$running" = /usr/local/bin/d ] || [ "$running" = "$DAIMON_LOCAL_SCRIPT" ]; } &&
+		[ -s /usr/local/bin/d ] && [ -s "$DAIMON_LOCAL_SCRIPT" ]; then
+		return 0
+	fi
 	# 直接运行 linux-toolbox.sh 时自动安装快捷命令 d，不再需要单独的 install.sh
 	sed -i '/^alias d=/d' ~/.bashrc > /dev/null 2>&1
 	sed -i '/^alias d=/d' ~/.profile > /dev/null 2>&1
@@ -418,26 +435,24 @@ daimon_self_install() {
 		keep_permission="true"
 	fi
 
-	# 本地执行 ./linux-toolbox.sh 时，优先复制本地文件；通过 bash <(curl ...) 运行时，优先重新下载完整脚本。
-	if [ -f ./linux-toolbox.sh ] && head -1 ./linux-toolbox.sh 2>/dev/null | grep -q '^#!/bin/bash'; then
-		local_source="./linux-toolbox.sh"
-	elif [ -n "${BASH_SOURCE[0]}" ] && [ -f "${BASH_SOURCE[0]}" ] && ! echo "${BASH_SOURCE[0]}" | grep -Eq '^/dev/fd/|^/proc/.*/fd/' && head -1 "${BASH_SOURCE[0]}" 2>/dev/null | grep -q '^#!/bin/bash'; then
+	# Install only the executing file, never a same-named file from the working directory.
+	if [ -n "${BASH_SOURCE[0]}" ] && [ -f "${BASH_SOURCE[0]}" ] && ! echo "${BASH_SOURCE[0]}" | grep -Eq '^/dev/fd/|^/proc/.*/fd/' && head -1 "${BASH_SOURCE[0]}" 2>/dev/null | grep -q '^#!/bin/bash'; then
 		local_source="${BASH_SOURCE[0]}"
 	elif [ -f "$0" ] && ! echo "$0" | grep -Eq '^/dev/fd/|^/proc/.*/fd/' && head -1 "$0" 2>/dev/null | grep -q '^#!/bin/bash'; then
 		local_source="$0"
 	fi
 
 	if [ -n "$local_source" ]; then
-		cp -f "$local_source" "$DAIMON_LOCAL_SCRIPT" > /dev/null 2>&1
+		daimon_install_script_file "$local_source" "$DAIMON_LOCAL_SCRIPT" || return 1
 	elif [ -n "$DAIMON_UPDATE_URL" ]; then
 		if daimon_download_update_file "$tmp_file" >/dev/null 2>&1; then
-			cp -f "$tmp_file" "$DAIMON_LOCAL_SCRIPT" > /dev/null 2>&1
+			daimon_install_script_file "$tmp_file" "$DAIMON_LOCAL_SCRIPT" || return 1
 		fi
 	fi
 
 	if [ -s "$DAIMON_LOCAL_SCRIPT" ]; then
 		chmod +x "$DAIMON_LOCAL_SCRIPT" > /dev/null 2>&1
-		cp -f "$DAIMON_LOCAL_SCRIPT" /usr/local/bin/d > /dev/null 2>&1
+		daimon_install_script_file "$DAIMON_LOCAL_SCRIPT" /usr/local/bin/d || return 1
 		chmod +x /usr/local/bin/d > /dev/null 2>&1
 		ln -sf /usr/local/bin/d /usr/bin/d > /dev/null 2>&1
 		if [ "$keep_permission" = "true" ]; then
@@ -468,7 +483,7 @@ UserLicenseAgreement() {
 	echo "使用说明: 本脚本为个人开源工具，按现状提供，请在了解命令作用后自行决定是否执行。"
 	echo "风险提示: 脚本中的系统配置、Docker、Nginx、证书、网络优化等操作可能修改服务器状态，请提前备份重要数据。"
 	echo -e "----------------------"
-	read -e -p "是否已阅读并确认继续使用？(y/n): " user_input
+	read -e -p "是否已阅读并确认继续使用？(y/n): " user_input || exit 1
 
 
 	if [ "$user_input" = "y" ] || [ "$user_input" = "Y" ]; then
@@ -524,38 +539,38 @@ install() {
 		return 1
 	fi
 
+	local package
 	for package in "$@"; do
 		if ! command -v "$package" &>/dev/null; then
 			echo -e "${gl_kjlan}正在安装 $package...${gl_bai}"
 			if command -v dnf &>/dev/null; then
-				dnf -y update
-				dnf install -y epel-release
-				dnf install -y "$package"
+				dnf makecache || return 1
+				dnf install -y epel-release || return 1
+				dnf install -y "$package" || return 1
 			elif command -v yum &>/dev/null; then
-				yum -y update
-				yum install -y epel-release
-				yum install -y "$package"
+				yum makecache || return 1
+				yum install -y epel-release || return 1
+				yum install -y "$package" || return 1
 			elif command -v apt &>/dev/null; then
-				DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none apt update -y
+				DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none apt update -y || return 1
 				DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none apt install -y \
 					-o Dpkg::Options::="--force-confdef" \
 					-o Dpkg::Options::="--force-confold" \
-					"$package"
+					"$package" || return 1
 			elif command -v apk &>/dev/null; then
-				apk update
-				apk add "$package"
+				apk update || return 1
+				apk add "$package" || return 1
 			elif command -v pacman &>/dev/null; then
-				pacman -Syu --noconfirm
-				pacman -S --noconfirm "$package"
+				pacman -Syu --noconfirm "$package" || return 1
 			elif command -v zypper &>/dev/null; then
-				zypper refresh
-				zypper install -y "$package"
+				zypper refresh || return 1
+				zypper install -y "$package" || return 1
 			elif command -v opkg &>/dev/null; then
-				opkg update
-				opkg install "$package"
+				opkg update || return 1
+				opkg install "$package" || return 1
 			elif command -v pkg &>/dev/null; then
-				pkg update
-				pkg install -y "$package"
+				pkg update || return 1
+				pkg install -y "$package" || return 1
 			else
 				echo "未知的包管理器!"
 				return 1
@@ -800,7 +815,7 @@ docker_mirror_menu() {
 	echo "------------------------"
 	echo "输入编号，使用空格分隔；直接回车使用默认源：1 2 3 4"
 	echo "输入 0 返回上一级菜单"
-	read -e -p "请选择: " selected
+	read -e -p "请选择: " selected || return 1
 	[ "$selected" = "0" ] && return 90
 	selected=${selected:-"1 2 3 4"}
 	{
@@ -867,7 +882,7 @@ docker_mirror_cleanup_test_image() {
 
 docker_mirror_ask_official() {
 	local answer
-	read -e -p "是否加入官方镜像源 registry-1.docker.io？(y/N): " answer
+	read -e -p "是否加入官方镜像源 registry-1.docker.io？(y/N): " answer || return 1
 	case "$answer" in
 		[Yy]) return 0 ;;
 		*) return 1 ;;
@@ -971,13 +986,13 @@ docker_mirror_speed_test_menu() {
 		echo "3. 测速第三方镜像源 + 默认镜像源"
 		echo "0. 返回上一级菜单"
 		echo "------------------------"
-		read -e -p "请输入你的选择: " choice
+		read -e -p "请输入你的选择: " choice || return 1
 		case "$choice" in
 			1)
 				local selected timeout_sec rounds add_official mirrors=()
-				read -e -i "1 2 3 4" -p "请选择默认镜像源编号（空格分隔）: " selected
-				read -e -i "100" -p "请输入超时时间（秒）: " timeout_sec
-				read -e -i "1" -p "请输入测速轮数: " rounds
+				read -e -i "1 2 3 4" -p "请选择默认镜像源编号（空格分隔）: " selected || return 1
+				read -e -i "100" -p "请输入超时时间（秒）: " timeout_sec || return 1
+				read -e -i "1" -p "请输入测速轮数: " rounds || return 1
 				if docker_mirror_ask_official; then add_official=yes; else add_official=no; fi
 				mapfile -t mirrors < <(docker_mirror_collect_defaults "$selected" "$add_official")
 				docker_mirror_speed_run "${timeout_sec:-100}" "${rounds:-1}" "${mirrors[@]}"
@@ -985,10 +1000,10 @@ docker_mirror_speed_test_menu() {
 				;;
 			2)
 				local third timeout_sec rounds mirrors=()
-				read -e -p "请输入第三方镜像源地址: " third
+				read -e -p "请输入第三方镜像源地址: " third || return 1
 				[ -z "$third" ] && echo "镜像源不能为空" && break_end && continue
-				read -e -i "100" -p "请输入超时时间（秒）: " timeout_sec
-				read -e -i "1" -p "请输入测速轮数: " rounds
+				read -e -i "100" -p "请输入超时时间（秒）: " timeout_sec || return 1
+				read -e -i "1" -p "请输入测速轮数: " rounds || return 1
 				mirrors+=("$(docker_mirror_scheme_url "$third")")
 				if docker_mirror_ask_official; then mirrors+=("https://registry-1.docker.io"); fi
 				docker_mirror_speed_run "${timeout_sec:-100}" "${rounds:-1}" "${mirrors[@]}"
@@ -996,11 +1011,11 @@ docker_mirror_speed_test_menu() {
 				;;
 			3)
 				local third selected timeout_sec rounds add_official mirrors=() default_selected=()
-				read -e -p "请输入第三方镜像源地址: " third
+				read -e -p "请输入第三方镜像源地址: " third || return 1
 				[ -z "$third" ] && echo "镜像源不能为空" && break_end && continue
-				read -e -i "1 2 3 4" -p "请选择默认镜像源编号（空格分隔）: " selected
-				read -e -i "100" -p "请输入超时时间（秒）: " timeout_sec
-				read -e -i "1" -p "请输入测速轮数: " rounds
+				read -e -i "1 2 3 4" -p "请选择默认镜像源编号（空格分隔）: " selected || return 1
+				read -e -i "100" -p "请输入超时时间（秒）: " timeout_sec || return 1
+				read -e -i "1" -p "请输入测速轮数: " rounds || return 1
 				mirrors+=("$(docker_mirror_scheme_url "$third")")
 				if docker_mirror_ask_official; then add_official=yes; else add_official=no; fi
 				mapfile -t default_selected < <(docker_mirror_collect_defaults "$selected" "$add_official")
@@ -1087,31 +1102,31 @@ while true; do
 	echo "------------------------"
 	echo "0. 返回上一级选单"
 	echo "------------------------"
-	read -e -p "请输入你的选择: " sub_choice
+	read -e -p "请输入你的选择: " sub_choice || return 1
 	case $sub_choice in
 		1)
 			send_stats "新建容器"
-			read -e -p "请输入创建命令: " dockername
+			read -e -p "请输入创建命令: " dockername || return 1
 			$dockername
 			;;
 		2)
 			send_stats "启动指定容器"
-			read -e -p "请输入容器名（多个容器名请用空格分隔）: " dockername
+			read -e -p "请输入容器名（多个容器名请用空格分隔）: " dockername || return 1
 			docker start $dockername
 			;;
 		3)
 			send_stats "停止指定容器"
-			read -e -p "请输入容器名（多个容器名请用空格分隔）: " dockername
+			read -e -p "请输入容器名（多个容器名请用空格分隔）: " dockername || return 1
 			docker stop $dockername
 			;;
 		4)
 			send_stats "删除指定容器"
-			read -e -p "请输入容器名（多个容器名请用空格分隔）: " dockername
+			read -e -p "请输入容器名（多个容器名请用空格分隔）: " dockername || return 1
 			docker rm -f $dockername
 			;;
 		5)
 			send_stats "重启指定容器"
-			read -e -p "请输入容器名（多个容器名请用空格分隔）: " dockername
+			read -e -p "请输入容器名（多个容器名请用空格分隔）: " dockername || return 1
 			docker restart $dockername
 			;;
 		6)
@@ -1124,7 +1139,7 @@ while true; do
 			;;
 		8)
 			send_stats "删除所有容器"
-			read -e -p "$(echo -e "${gl_hong}注意: ${gl_bai}确定删除所有容器吗？(Y/N): ")" choice
+			read -e -p "$(echo -e "${gl_hong}注意: ${gl_bai}确定删除所有容器吗？(Y/N): ")" choice || return 1
 			case "$choice" in
 			  [Yy])
 				docker rm -f $(docker ps -a -q)
@@ -1142,13 +1157,13 @@ while true; do
 			;;
 		11)
 			send_stats "进入容器"
-			read -e -p "请输入容器名: " dockername
+			read -e -p "请输入容器名: " dockername || return 1
 			docker exec -it $dockername /bin/sh
 			break_end
 			;;
 		12)
 			send_stats "查看容器日志"
-			read -e -p "请输入容器名: " dockername
+			read -e -p "请输入容器名: " dockername || return 1
 			docker logs $dockername
 			break_end
 			;;
@@ -1178,7 +1193,7 @@ while true; do
 
 		15)
 			send_stats "允许容器端口访问"
-			read -e -p "请输入容器名: " docker_name
+			read -e -p "请输入容器名: " docker_name || return 1
 			ip_address
 			clear_container_rules "$docker_name" "$ipv4_address"
 			local docker_port=$(docker port $docker_name | awk -F'[:]' '/->/ {print $NF}' | uniq)
@@ -1188,7 +1203,7 @@ while true; do
 
 		16)
 			send_stats "阻止容器端口访问"
-			read -e -p "请输入容器名: " docker_name
+			read -e -p "请输入容器名: " docker_name || return 1
 			ip_address
 			block_container_port "$docker_name" "$ipv4_address"
 			local docker_port=$(docker port $docker_name | awk -F'[:]' '/->/ {print $NF}' | uniq)
@@ -1221,11 +1236,11 @@ while true; do
 	echo "------------------------"
 	echo "0. 返回上一级选单"
 	echo "------------------------"
-	read -e -p "请输入你的选择: " sub_choice
+	read -e -p "请输入你的选择: " sub_choice || return 1
 	case $sub_choice in
 		1)
 			send_stats "拉取镜像"
-			read -e -p "请输入镜像名（多个镜像名请用空格分隔）: " imagenames
+			read -e -p "请输入镜像名（多个镜像名请用空格分隔）: " imagenames || return 1
 			for name in $imagenames; do
 				echo -e "${gl_kjlan}正在获取镜像: $name${gl_bai}"
 				docker pull $name
@@ -1233,7 +1248,7 @@ while true; do
 			;;
 		2)
 			send_stats "更新镜像"
-			read -e -p "请输入镜像名（多个镜像名请用空格分隔）: " imagenames
+			read -e -p "请输入镜像名（多个镜像名请用空格分隔）: " imagenames || return 1
 			for name in $imagenames; do
 				echo -e "${gl_kjlan}正在更新镜像: $name${gl_bai}"
 				docker pull $name
@@ -1241,14 +1256,14 @@ while true; do
 			;;
 		3)
 			send_stats "删除镜像"
-			read -e -p "请输入镜像名（多个镜像名请用空格分隔）: " imagenames
+			read -e -p "请输入镜像名（多个镜像名请用空格分隔）: " imagenames || return 1
 			for name in $imagenames; do
 				docker rmi -f $name
 			done
 			;;
 		4)
 			send_stats "删除所有镜像"
-			read -e -p "$(echo -e "${gl_hong}注意: ${gl_bai}确定删除所有镜像吗？(Y/N): ")" choice
+			read -e -p "$(echo -e "${gl_hong}注意: ${gl_bai}确定删除所有镜像吗？(Y/N): ")" choice || return 1
 			case "$choice" in
 			  [Yy])
 				docker rmi -f $(docker images -q)
@@ -1704,15 +1719,15 @@ iptables_panel() {
 		  echo "------------------------"
 		  echo "0. 返回上一级选单"
 		  echo "------------------------"
-		  read -e -p "请输入你的选择: " sub_choice
+		  read -e -p "请输入你的选择: " sub_choice || return 1
 		  case $sub_choice in
 			  1)
-				  read -e -p "请输入开放的端口号: " o_port
+				  read -e -p "请输入开放的端口号: " o_port || return 1
 				  open_port $o_port
 				  send_stats "开放指定端口"
 				  ;;
 			  2)
-				  read -e -p "请输入关闭的端口号: " c_port
+				  read -e -p "请输入关闭的端口号: " c_port || return 1
 				  close_port $c_port
 				  send_stats "关闭指定端口"
 				  ;;
@@ -1751,17 +1766,17 @@ iptables_panel() {
 
 			  5)
 				  # IP 白名单
-				  read -e -p "请输入放行的IP或IP段: " o_ip
+				  read -e -p "请输入放行的IP或IP段: " o_ip || return 1
 				  allow_ip $o_ip
 				  ;;
 			  6)
 				  # IP 黑名单
-				  read -e -p "请输入封锁的IP或IP段: " c_ip
+				  read -e -p "请输入封锁的IP或IP段: " c_ip || return 1
 				  block_ip $c_ip
 				  ;;
 			  7)
 				  # 清除指定 IP
-				  read -e -p "请输入清除的IP: " d_ip
+				  read -e -p "请输入清除的IP: " d_ip || return 1
 				  iptables -D INPUT -s $d_ip -j ACCEPT 2>/dev/null
 				  iptables -D INPUT -s $d_ip -j DROP 2>/dev/null
 				  iptables-save > /etc/iptables/rules.v4
@@ -1789,18 +1804,18 @@ iptables_panel() {
 				  ;;
 
 			  15)
-				  read -e -p "请输入阻止的国家代码（多个国家代码可用空格隔开如 CN US JP）: " country_code
+				  read -e -p "请输入阻止的国家代码（多个国家代码可用空格隔开如 CN US JP）: " country_code || return 1
 				  manage_country_rules block $country_code
 				  send_stats "允许国家 $country_code 的IP"
 				  ;;
 			  16)
-				  read -e -p "请输入允许的国家代码（多个国家代码可用空格隔开如 CN US JP）: " country_code
+				  read -e -p "请输入允许的国家代码（多个国家代码可用空格隔开如 CN US JP）: " country_code || return 1
 				  manage_country_rules allow $country_code
 				  send_stats "阻止国家 $country_code 的IP"
 				  ;;
 
 			  17)
-				  read -e -p "请输入清除的国家代码（多个国家代码可用空格隔开如 CN US JP）: " country_code
+				  read -e -p "请输入清除的国家代码（多个国家代码可用空格隔开如 CN US JP）: " country_code || return 1
 				  manage_country_rules unblock $country_code
 				  send_stats "清除国家 $country_code 的IP"
 				  ;;
@@ -2235,7 +2250,7 @@ certs_status() {
 		echo "------------------------"
 		echo "1. 重新申请        2. 导入已有证书        0. 退出"
 		echo "------------------------"
-		read -e -p "请输入你的选择: " sub_choice
+		read -e -p "请输入你的选择: " sub_choice || return 1
 		case $sub_choice in
 	  	  1)
 	  	  	send_stats "重新申请"
@@ -2312,7 +2327,7 @@ fi
 add_yuming() {
 	  ip_address
 	  echo -e "先将域名解析到本机IP: ${gl_huang}$ipv4_address  $ipv6_address${gl_bai}"
-	  read -e -p "请输入你的IP或者解析过的域名: " yuming
+	  read -e -p "请输入你的IP或者解析过的域名: " yuming || return 1
 }
 
 
@@ -2323,7 +2338,7 @@ check_ip_and_get_access_port() {
 	local ipv6_pattern='^(([0-9A-Fa-f]{1,4}:){1,7}:|([0-9A-Fa-f]{1,4}:){7,7}[0-9A-Fa-f]{1,4}|::1)$'
 
 	if [[ "$yuming" =~ $ipv4_pattern || "$yuming" =~ $ipv6_pattern ]]; then
-		read -e -p "请输入访问/监听端口，回车默认使用 80: " access_port
+		read -e -p "请输入访问/监听端口，回车默认使用 80: " access_port || return 1
 		access_port=${access_port:-80}
 	fi
 }
@@ -2398,7 +2413,7 @@ nginx_upgrade() {
 
 phpmyadmin_upgrade() {
   local ldnmp_pods="phpmyadmin"
-  local local docker_port=8877
+  local docker_port=8877
   local dbuse=$(grep -oP 'MYSQL_USER:\s*\K.*' /home/web/docker-compose.yml | tr -d '[:space:]')
   local dbusepasswd=$(grep -oP 'MYSQL_PASSWORD:\s*\K.*' /home/web/docker-compose.yml | tr -d '[:space:]')
 
@@ -2433,12 +2448,12 @@ cf_purge_cache() {
 	ZONE_IDS=($ZONE_IDS)
   else
 	# 提示用户是否清理缓存
-	read -e -p "需要清理 Cloudflare 的缓存吗？（y/n）: " answer
+	read -e -p "需要清理 Cloudflare 的缓存吗？（y/n）: " answer || return 1
 	if [[ "$answer" == "y" ]]; then
 	  echo "CF信息保存在$CONFIG_FILE，可以后期修改CF信息"
-	  read -e -p "请输入你的 API_TOKEN: " API_TOKEN
-	  read -e -p "请输入你的CF用户名: " EMAIL
-	  read -e -p "请输入 zone_id（多个用空格分隔）: " -a ZONE_IDS
+	  read -e -p "请输入你的 API_TOKEN: " API_TOKEN || return 1
+	  read -e -p "请输入你的CF用户名: " EMAIL || return 1
+	  read -e -p "请输入 zone_id（多个用空格分隔）: " -a ZONE_IDS || return 1
 
 	  mkdir -p /home/web/config/
 	  echo "$API_TOKEN $EMAIL ${ZONE_IDS[*]}" > "$CONFIG_FILE"
@@ -2473,7 +2488,7 @@ web_del() {
 	send_stats "删除站点数据"
 	yuming_list="${1:-}"
 	if [ -z "$yuming_list" ]; then
-		read -e -p "删除站点数据，请输入你的域名（多个域名用空格隔开）: " yuming_list
+		read -e -p "删除站点数据，请输入你的域名（多个域名用空格隔开）: " yuming_list || return 1
 		if [[ -z "$yuming_list" ]]; then
 			return
 		fi
@@ -2810,7 +2825,7 @@ web_security() {
 			  echo "------------------------"
 			  echo "0. 返回上一级选单"
 			  echo "------------------------"
-			  read -e -p "请输入你的选择: " sub_choice
+			  read -e -p "请输入你的选择: " sub_choice || return 1
 			  case $sub_choice in
 				  1)
 					  f2b_install_sshd
@@ -2894,8 +2909,8 @@ web_security() {
 					  send_stats "cloudflare模式"
 					  echo "到cf后台右上角我的个人资料，选择左侧API令牌，获取Global API Key"
 					  echo "https://dash.cloudflare.com/login"
-					  read -e -p "输入CF的账号: " cfuser
-					  read -e -p "输入CF的Global API Key: " cftoken
+					  read -e -p "输入CF的账号: " cfuser || return 1
+					  read -e -p "输入CF的Global API Key: " cftoken || return 1
 
 					  wget -O /home/web/conf.d/default.conf ${gh_proxy}raw.githubusercontent.com/kejilion/nginx/main/default11.conf
 					  docker exec nginx nginx -s reload
@@ -2922,9 +2937,9 @@ web_security() {
 					  echo -e "到cf后台域名概要页面右下方获取${gl_huang}区域ID${gl_bai}"
 					  echo "https://dash.cloudflare.com/login"
 					  echo "--------------"
-					  read -e -p "输入CF的账号: " cfuser
-					  read -e -p "输入CF的Global API Key: " cftoken
-					  read -e -p "输入CF中域名的区域ID: " cfzonID
+					  read -e -p "输入CF的账号: " cfuser || return 1
+					  read -e -p "输入CF的Global API Key: " cftoken || return 1
+					  read -e -p "输入CF中域名的区域ID: " cfzonID || return 1
 
 					  install jq bc
 					  check_crontab_installed
@@ -3039,7 +3054,7 @@ web_optimization() {
 			  echo "------------------------"
 			  echo "0. 返回上一级选单"
 			  echo "------------------------"
-			  read -e -p "请输入你的选择: " sub_choice
+			  read -e -p "请输入你的选择: " sub_choice || return 1
 			  case $sub_choice in
 				  1)
 				  send_stats "站点标准模式"
@@ -3563,13 +3578,13 @@ while true; do
 	echo "------------------------"
 	echo "0. 返回上一级选单"
 	echo "------------------------"
-	read -e -p "请输入你的选择: " choice
+	read -e -p "请输入你的选择: " choice || return 1
 	 case $choice in
 		1)
 			setup_docker_dir
 			check_disk_space $app_size /home/docker
 			while true; do
-				read -e -p "输入应用对外服务端口，回车默认使用${docker_port}端口: " app_port
+				read -e -p "输入应用对外服务端口，回车默认使用${docker_port}端口: " app_port || return 1
 				local app_port=${app_port:-${docker_port}}
 
 				if ss -tuln | grep -q ":$app_port "; then
@@ -3685,14 +3700,14 @@ docker_app_plus() {
 		echo "------------------------"
 		echo "0. 返回上一级选单"
 		echo "------------------------"
-		read -e -p "输入你的选择: " choice
+		read -e -p "输入你的选择: " choice || return 1
 		case $choice in
 			1)
 				setup_docker_dir
 				check_disk_space $app_size /home/docker
 
 				while true; do
-					read -e -p "输入应用对外服务端口，回车默认使用${docker_port}端口: " app_port
+					read -e -p "输入应用对外服务端口，回车默认使用${docker_port}端口: " app_port || return 1
 					local app_port=${app_port:-${docker_port}}
 
 					if ss -tuln | grep -q ":$app_port "; then
@@ -3917,9 +3932,9 @@ f2b_basic_config() {
 	fi
 
 	echo "即将配置 SSH jail：$jail_name"
-	read -e -p "封禁时长 bantime (秒/分钟/小时，如 3600 或 1h) [默认 1h]: " bantime
-	read -e -p "时间窗口 findtime (秒/分钟/小时，如 600 或 10m) [默认 10m]: " findtime
-	read -e -p "重试次数 maxretry (整数) [默认 5]: " maxretry
+	read -e -p "封禁时长 bantime (秒/分钟/小时，如 3600 或 1h) [默认 1h]: " bantime || return 1
+	read -e -p "时间窗口 findtime (秒/分钟/小时，如 600 或 10m) [默认 10m]: " findtime || return 1
+	read -e -p "重试次数 maxretry (整数) [默认 5]: " maxretry || return 1
 
 	bantime=${bantime:-1h}
 	findtime=${findtime:-10m}
@@ -3974,7 +3989,7 @@ f2b_edit_config() {
 
 server_reboot() {
 
-	read -e -p "$(echo -e "${gl_huang}提示: ${gl_bai}现在重启服务器吗？(Y/N): ")" rboot
+	read -e -p "$(echo -e "${gl_huang}提示: ${gl_bai}现在重启服务器吗？(Y/N): ")" rboot || return 1
 	case "$rboot" in
 	  [Yy])
 		echo "已重启"
@@ -4185,12 +4200,12 @@ ldnmp_Proxy() {
 	check_ip_and_get_access_port "$yuming"
 
 	if [ -z "$reverseproxy" ]; then
-		read -e -p "请输入你的反代IP (回车默认本机IP 127.0.0.1): " reverseproxy
+		read -e -p "请输入你的反代IP (回车默认本机IP 127.0.0.1): " reverseproxy || return 1
 		reverseproxy=${reverseproxy:-127.0.0.1}
 	fi
 
 	if [ -z "$port" ]; then
-		read -e -p "请输入你的反代端口: " port
+		read -e -p "请输入你的反代端口: " port || return 1
 	fi
 	nginx_install_status
 
@@ -4238,7 +4253,7 @@ ldnmp_Proxy_backend() {
 	check_ip_and_get_access_port "$yuming"
 
 	if [ -z "$reverseproxy_port" ]; then
-		read -e -p "请输入你的多个反代IP+端口用空格隔开（例如 127.0.0.1:3000 127.0.0.1:3002）： " reverseproxy_port
+		read -e -p "请输入你的多个反代IP+端口用空格隔开（例如 127.0.0.1:3000 127.0.0.1:3002）： " reverseproxy_port || return 1
 	fi
 
 	nginx_install_status
@@ -4343,7 +4358,7 @@ stream_panel() {
 		echo "------------------------"
 		echo "0. 返回上一级选单"
 		echo "------------------------"
-		read -e -p "输入你的选择: " choice
+		read -e -p "输入你的选择: " choice || return 1
 		case $choice in
 			1)
 				nginx_install_status
@@ -4357,7 +4372,7 @@ stream_panel() {
 				send_stats "更新Stream四层代理"
 				;;
 			3)
-				read -e -p "确定要删除 nginx 容器吗？这可能会影响网站功能！(y/N): " confirm
+				read -e -p "确定要删除 nginx 容器吗？这可能会影响网站功能！(y/N): " confirm || return 1
 				if [[ "$confirm" =~ ^[Yy]$ ]]; then
 					docker rm -f nginx
 					sed -i "/\b${app_id}\b/d" /home/docker/appno.txt
@@ -4376,7 +4391,7 @@ stream_panel() {
 				;;
 			5)
 				send_stats "编辑转发配置"
-				read -e -p "请输入你要编辑的服务名: " stream_name
+				read -e -p "请输入你要编辑的服务名: " stream_name || return 1
 				install vim
 				vim /home/web/stream.d/$stream_name.conf
 				docker restart nginx
@@ -4384,7 +4399,7 @@ stream_panel() {
 				;;
 			6)
 				send_stats "删除转发配置"
-				read -e -p "请输入你要删除的服务名: " stream_name
+				read -e -p "请输入你要删除的服务名: " stream_name || return 1
 				rm /home/web/stream.d/$stream_name.conf > /dev/null 2>&1
 				docker restart nginx
 				send_stats "删除四层代理"
@@ -4407,20 +4422,20 @@ ldnmp_Proxy_backend_stream() {
 	echo "开始部署 $webname"
 
 	# 获取代理名称
-	read -erp "请输入代理转发名称 (如 mysql_proxy): " proxy_name
+	read -erp "请输入代理转发名称 (如 mysql_proxy): " proxy_name || return 1
 	if [ -z "$proxy_name" ]; then
 		echo "名称不能为空"; return 1
 	fi
 
 	# 获取监听端口
-	read -erp "请输入本机监听端口 (如 3306): " listen_port
+	read -erp "请输入本机监听端口 (如 3306): " listen_port || return 1
 	if ! [[ "$listen_port" =~ ^[0-9]+$ ]]; then
 		echo "端口必须是数字"; return 1
 	fi
 
 	echo "请选择协议类型："
 	echo "1. TCP    2. UDP"
-	read -erp "请输入序号 [1-2]: " proto_choice
+	read -erp "请输入序号 [1-2]: " proto_choice || return 1
 
 	case "$proto_choice" in
 		1) proto="tcp"; listen_suffix="" ;;
@@ -4428,7 +4443,7 @@ ldnmp_Proxy_backend_stream() {
 		*) echo "无效选择"; return 1 ;;
 	esac
 
-	read -e -p "请输入你的一个或者多个后端IP+端口用空格隔开（例如 10.13.0.2:3306 10.13.0.3:3306）： " reverseproxy_port
+	read -e -p "请输入你的一个或者多个后端IP+端口用空格隔开（例如 10.13.0.2:3306 10.13.0.3:3306）： " reverseproxy_port || return 1
 
 	nginx_install_status
 	cd /home && mkdir -p web/stream.d
@@ -4551,11 +4566,11 @@ ldnmp_web_status() {
 		echo "------------------------"
 		echo "0. 返回上一级选单"
 		echo "------------------------"
-		read -e -p "请输入你的选择: " sub_choice
+		read -e -p "请输入你的选择: " sub_choice || return 1
 		case $sub_choice in
 			1)
 				send_stats "申请域名证书"
-				read -e -p "请输入你的域名: " yuming
+				read -e -p "请输入你的域名: " yuming || return 1
 				install_certbot
 				docker run --rm -v /etc/letsencrypt/:/etc/letsencrypt certbot/certbot delete --cert-name "$yuming" -n 2>/dev/null
 				install_ssltls
@@ -4565,8 +4580,8 @@ ldnmp_web_status() {
 
 			2)
 				send_stats "克隆站点域名"
-				read -e -p "请输入旧域名: " oddyuming
-				read -e -p "请输入新域名: " yuming
+				read -e -p "请输入旧域名: " oddyuming || return 1
+				read -e -p "请输入新域名: " yuming || return 1
 				install_certbot
 				install_ssltls
 				certs_status
@@ -4606,8 +4621,8 @@ ldnmp_web_status() {
 			4)
 				send_stats "创建关联站点"
 				echo -e "为现有的站点再关联一个新域名用于访问"
-				read -e -p "请输入现有的域名: " oddyuming
-				read -e -p "请输入新域名: " yuming
+				read -e -p "请输入现有的域名: " oddyuming || return 1
+				read -e -p "请输入新域名: " yuming || return 1
 				install_certbot
 				install_ssltls
 				certs_status
@@ -4639,7 +4654,7 @@ ldnmp_web_status() {
 
 			8)
 				send_stats "编辑站点配置"
-				read -e -p "编辑站点配置，请输入你要编辑的域名: " yuming
+				read -e -p "编辑站点配置，请输入你要编辑的域名: " yuming || return 1
 				install vim
 				vim /home/web/conf.d/$yuming.conf
 				docker exec nginx nginx -s reload
@@ -4694,7 +4709,7 @@ while true; do
 	echo "------------------------"
 	echo "0. 返回上一级选单"
 	echo "------------------------"
-	read -e -p "请输入你的选择: " choice
+	read -e -p "请输入你的选择: " choice || return 1
 	 case $choice in
 		1)
 			check_disk_space 1
@@ -4803,8 +4818,8 @@ EOF
 
 configure_frpc() {
 	send_stats "安装frp客户端"
-	read -e -p "请输入外网对接IP: " server_addr
-	read -e -p "请输入外网对接token: " token
+	read -e -p "请输入外网对接IP: " server_addr || return 1
+	read -e -p "请输入外网对接token: " token || return 1
 	echo
 
 	mkdir -p /home/frp
@@ -4826,13 +4841,13 @@ EOF
 add_forwarding_service() {
 	send_stats "添加frp内网服务"
 	# 提示用户输入服务名称和转发信息
-	read -e -p "请输入服务名称: " service_name
-	read -e -p "请输入转发类型 (tcp/udp) [回车默认tcp]: " service_type
+	read -e -p "请输入服务名称: " service_name || return 1
+	read -e -p "请输入转发类型 (tcp/udp) [回车默认tcp]: " service_type || return 1
 	local service_type=${service_type:-tcp}
-	read -e -p "请输入内网IP [回车默认127.0.0.1]: " local_ip
+	read -e -p "请输入内网IP [回车默认127.0.0.1]: " local_ip || return 1
 	local local_ip=${local_ip:-127.0.0.1}
-	read -e -p "请输入内网端口: " local_port
-	read -e -p "请输入外网端口: " remote_port
+	read -e -p "请输入内网端口: " local_port || return 1
+	read -e -p "请输入外网端口: " remote_port || return 1
 
 	# 将用户输入写入配置文件
 	cat <<EOF >> /home/frp/frpc.toml
@@ -4858,7 +4873,7 @@ EOF
 delete_forwarding_service() {
 	send_stats "删除frp内网服务"
 	# 提示用户输入需要删除的服务名称
-	read -e -p "请输入需要删除的服务名称: " service_name
+	read -e -p "请输入需要删除的服务名称: " service_name || return 1
 	# 使用 sed 删除该服务及其相关配置
 	sed -i "/\[$service_name\]/,/^$/d" /home/frp/frpc.toml
 	echo "服务 $service_name 已成功从 frpc.toml 删除"
@@ -5039,7 +5054,7 @@ frps_panel() {
 		echo "------------------------"
 		echo "00. 刷新服务状态         0. 返回上一级选单"
 		echo "------------------------"
-		read -e -p "输入你的选择: " choice
+		read -e -p "输入你的选择: " choice || return 1
 		case $choice in
 			1)
 				install jq grep ss
@@ -5074,7 +5089,7 @@ frps_panel() {
 				echo "将内网穿透服务反代成域名访问"
 				send_stats "FRP对外域名访问"
 				add_yuming
-				read -e -p "请输入你的内网穿透服务端口: " frps_port
+				read -e -p "请输入你的内网穿透服务端口: " frps_port || return 1
 				ldnmp_Proxy ${yuming} 127.0.0.1 ${frps_port}
 				block_host_port "$frps_port" "$ipv4_address"
 				;;
@@ -5085,14 +5100,14 @@ frps_panel() {
 
 			7)
 				send_stats "允许IP访问"
-				read -e -p "请输入需要放行的端口: " frps_port
+				read -e -p "请输入需要放行的端口: " frps_port || return 1
 				clear_host_port_rules "$frps_port" "$ipv4_address"
 				;;
 
 			8)
 				send_stats "阻止IP访问"
 				echo "如果你已经反代域名访问了，可用此功能阻止IP+端口访问，这样更安全。"
-				read -e -p "请输入需要阻止的端口: " frps_port
+				read -e -p "请输入需要阻止的端口: " frps_port || return 1
 				block_host_port "$frps_port" "$ipv4_address"
 				;;
 
@@ -5136,7 +5151,7 @@ frpc_panel() {
 		echo "------------------------"
 		echo "0. 返回上一级选单"
 		echo "------------------------"
-		read -e -p "输入你的选择: " choice
+		read -e -p "输入你的选择: " choice || return 1
 		case $choice in
 			1)
 				install jq grep ss
@@ -5226,7 +5241,7 @@ yt_menu_pro() {
 		echo "-------------------------"
 		echo "0. 返回上一级选单"
 		echo "-------------------------"
-		read -e -p "请输入选项编号: " choice
+		read -e -p "请输入选项编号: " choice || return 1
 
 		case $choice in
 			1)
@@ -5257,7 +5272,7 @@ yt_menu_pro() {
 				read ;;
 			5)
 				send_stats "单个视频下载"
-				read -e -p "请输入视频链接: " url
+				read -e -p "请输入视频链接: " url || return 1
 				yt-dlp -P "$VIDEO_DIR" -f "bv*+ba/b" --merge-output-format mp4 \
 					--write-subs --sub-langs all \
 					--write-thumbnail --embed-thumbnail \
@@ -5283,7 +5298,7 @@ yt_menu_pro() {
 				read -e -p "批量下载完成，按任意键继续..." ;;
 			7)
 				send_stats "自定义视频下载"
-				read -e -p "请输入完整 yt-dlp 参数（不含 yt-dlp）: " custom
+				read -e -p "请输入完整 yt-dlp 参数（不含 yt-dlp）: " custom || return 1
 				yt-dlp -P "$VIDEO_DIR" $custom \
 					--write-subs --sub-langs all \
 					--write-thumbnail --embed-thumbnail \
@@ -5293,7 +5308,7 @@ yt_menu_pro() {
 				read -e -p "执行完成，按任意键继续..." ;;
 			8)
 				send_stats "MP3下载"
-				read -e -p "请输入视频链接: " url
+				read -e -p "请输入视频链接: " url || return 1
 				yt-dlp -P "$VIDEO_DIR" -x --audio-format mp3 \
 					--write-subs --sub-langs all \
 					--write-thumbnail --embed-thumbnail \
@@ -5304,7 +5319,7 @@ yt_menu_pro() {
 
 			9)
 				send_stats "删除视频"
-				read -e -p "请输入删除视频名称: " rmdir
+				read -e -p "请输入删除视频名称: " rmdir || return 1
 				if [ -z "$rmdir" ] || [ "$rmdir" = "." ] || [ "$rmdir" = ".." ] || [[ "$rmdir" == */* ]]; then
 					echo -e "${gl_hong}名称无效，未删除任何内容。${gl_bai}"
 				elif [ ! -e "$VIDEO_DIR/$rmdir" ]; then
@@ -5557,7 +5572,7 @@ while true; do
 	echo "------------------------"
 	echo "0. 返回上一级选单"
 	echo "------------------------"
-	read -e -p "请输入你的选择: " Limiting
+	read -e -p "请输入你的选择: " Limiting || return 1
 	case "$Limiting" in
 	  1)
 		local dns1_ipv4="1.1.1.1"
@@ -5694,7 +5709,7 @@ import_sshkey() {
 	local auth_keys="${ssh_dir}/authorized_keys"
 
 	if [[ -z "$public_key" ]]; then
-		read -e -p "请输入您的SSH公钥内容（通常以 'ssh-rsa' 或 'ssh-ed25519' 开头）: " public_key
+		read -e -p "请输入您的SSH公钥内容（通常以 'ssh-rsa' 或 'ssh-ed25519' 开头）: " public_key || return 1
 	fi
 
 	if [[ -z "$public_key" ]]; then
@@ -5732,7 +5747,7 @@ fetch_remote_ssh_keys() {
 	local temp_file
 
 	if [[ -z "${keys_url}" ]]; then
-		read -e -p "请输入您的远端公钥URL： " keys_url
+		read -e -p "请输入您的远端公钥URL： " keys_url || return 1
 	fi
 
 	echo "此脚本将从远程 URL 拉取 SSH 公钥，并添加到 ${authorized_keys}"
@@ -5826,7 +5841,7 @@ fetch_github_ssh_keys() {
 
 
 	if [[ -z "${username}" ]]; then
-		read -e -p "请输入您的 GitHub 用户名（username，不含 @）： " username
+		read -e -p "请输入您的 GitHub 用户名（username，不含 @）： " username || return 1
 	fi
 
 	if [[ -z "${username}" ]]; then
@@ -5863,7 +5878,7 @@ sshkey_panel() {
 	  echo "------------------------"
 	  echo "0. 返回上一级选单"
 	  echo "------------------------"
-	  read -e -p "请输入你的选择: " host_dns
+	  read -e -p "请输入你的选择: " host_dns || return 1
 	  case $host_dns in
 		  1)
 	  		send_stats "生成新密钥"
@@ -5882,7 +5897,7 @@ sshkey_panel() {
 			  ;;
 		  4)
 			send_stats "导入URL远端公钥"
-			read -e -p "请输入您的远端公钥URL： " keys_url
+			read -e -p "请输入您的远端公钥URL： " keys_url || return 1
 			fetch_remote_ssh_keys "${keys_url}"
 			break_end
 			  ;;
@@ -5929,7 +5944,7 @@ add_sshpasswd() {
 
 	# 如果没有通过参数传入，则交互输入
 	if [[ -z "$target_user" ]]; then
-		read -e -p "请输入要修改密码的用户名（默认 root）: " target_user
+		read -e -p "请输入要修改密码的用户名（默认 root）: " target_user || return 1
 	fi
 
 	# 回车不输入，默认 root
@@ -6164,7 +6179,7 @@ bbrv3() {
 				  echo "------------------------"
 				  echo "0. 返回上一级选单"
 				  echo "------------------------"
-				  read -e -p "请输入你的选择: " sub_choice
+				  read -e -p "请输入你的选择: " sub_choice || return 1
 
 				  case $sub_choice in
 					  1)
@@ -6188,7 +6203,7 @@ bbrv3() {
 		  echo "仅支持Debian/Ubuntu"
 		  echo "请备份数据，将为你升级Linux内核开启BBR3"
 		  echo "------------------------------------------------"
-		  read -e -p "确定继续吗？(Y/N): " choice
+		  read -e -p "确定继续吗？(Y/N): " choice || return 1
 
 		  case "$choice" in
 			[Yy])
@@ -6262,7 +6277,7 @@ elrepo() {
 				  echo "------------------------"
 				  echo "0. 返回上一级选单"
 				  echo "------------------------"
-				  read -e -p "请输入你的选择: " sub_choice
+				  read -e -p "请输入你的选择: " sub_choice || return 1
 
 				  case $sub_choice in
 					  1)
@@ -6296,7 +6311,7 @@ elrepo() {
 		  echo "仅支持红帽系列发行版 CentOS/RedHat/Alma/Rocky/oracle "
 		  echo "升级Linux内核可提升系统性能和安全，建议有条件的尝试，生产环境谨慎升级！"
 		  echo "------------------------------------------------"
-		  read -e -p "确定继续吗？(Y/N): " choice
+		  read -e -p "确定继续吗？(Y/N): " choice || return 1
 
 		  case "$choice" in
 			[Yy])
@@ -6334,7 +6349,7 @@ clamav_scan() {
 		return
 	fi
 
-	echo -e "${gl_kjlan}正在扫描目录$@... ${gl_bai}"
+	echo -e "${gl_kjlan}正在扫描目录 $*... ${gl_bai}"
 
 	# 构建 mount 参数
 	local MOUNT_PARAMS=""
@@ -6360,7 +6375,7 @@ clamav_scan() {
 		clamav/clamav-debian:latest \
 		clamscan -r --log=/var/log/clamav/scan.log $SCAN_PARAMS
 
-	echo -e "${gl_lv}$@ 扫描完成，病毒报告存放在${gl_huang}/home/docker/clamav/log/scan.log${gl_bai}"
+	echo -e "${gl_lv}$* 扫描完成，病毒报告存放在${gl_huang}/home/docker/clamav/log/scan.log${gl_bai}"
 	echo -e "${gl_lv}如果有病毒请在${gl_huang}scan.log${gl_lv}文件中搜索FOUND关键字确认病毒位置 ${gl_bai}"
 
 }
@@ -6386,7 +6401,7 @@ clamav() {
 				echo "------------------------"
 				echo "0. 返回上一级选单"
 				echo "------------------------"
-				read -e -p "请输入你的选择: " sub_choice
+				read -e -p "请输入你的选择: " sub_choice || return 1
 				case $sub_choice in
 					1)
 					  send_stats "全盘扫描"
@@ -6407,7 +6422,7 @@ clamav() {
 						;;
 					3)
 					  send_stats "自定义目录扫描"
-					  read -e -p "请输入要扫描的目录，用空格分隔（例如：/etc /var /usr /home /root）: " directories
+					  read -e -p "请输入要扫描的目录，用空格分隔（例如：/etc /var /usr /home /root）: " directories || return 1
 					  install_docker
 					  clamav_freshclam
 					  clamav_scan $directories
@@ -6795,7 +6810,7 @@ Kernel_optimize() {
 	  echo "--------------------"
 	  echo "0. 返回上一级选单"
 	  echo "--------------------"
-	  read -e -p "请输入你的选择: " sub_choice
+	  read -e -p "请输入你的选择: " sub_choice || return 1
 	  case $sub_choice in
 		  1)
 			  cd ~
@@ -6918,7 +6933,7 @@ while true; do
   echo "------------------------"
   echo "0. 返回上一级选单"
   echo "------------------------"
-  read -e -p "输入你的选择: " choice
+  read -e -p "输入你的选择: " choice || return 1
 
   case $choice in
 	  1)
@@ -7003,7 +7018,7 @@ shell_bianse() {
 	echo "------------------------"
 	echo "0. 返回上一级选单"
 	echo "------------------------"
-	read -e -p "输入你的选择: " choice
+	read -e -p "输入你的选择: " choice || return 1
 
 	case $choice in
 	  1)
@@ -7073,7 +7088,7 @@ linux_trash() {
 	echo "------------------------"
 	echo "0. 返回上一级选单"
 	echo "------------------------"
-	read -e -p "输入你的选择: " choice
+	read -e -p "输入你的选择: " choice || return 1
 
 	case $choice in
 	  1)
@@ -7093,7 +7108,7 @@ linux_trash() {
 		sleep 2
 		;;
 	  3)
-		read -e -p "输入要还原的文件名: " file_to_restore
+		read -e -p "输入要还原的文件名: " file_to_restore || return 1
 		if [ -e "$TRASH_DIR/$file_to_restore" ]; then
 		  mv "$TRASH_DIR/$file_to_restore" "$HOME/"
 		  echo "$file_to_restore 已还原到主目录。"
@@ -7102,7 +7117,7 @@ linux_trash() {
 		fi
 		;;
 	  4)
-		read -e -p "确认清空回收站？[y/n]: " confirm
+		read -e -p "确认清空回收站？[y/n]: " confirm || return 1
 		if [[ "$confirm" == "y" ]]; then
 		  trash-empty
 		  echo "回收站已清空。"
@@ -7130,7 +7145,7 @@ create_backup() {
 	echo "  - 备份单个目录: /var/www"
 	echo "  - 备份多个目录: /etc /home /var/log"
 	echo "  - 直接回车将使用默认目录 (/etc /usr /home)"
-	read -e -p "请输入要备份的目录（多个目录用空格分隔，直接回车则使用默认目录）：" input
+	read -e -p "请输入要备份的目录（多个目录用空格分隔，直接回车则使用默认目录）：" input || return 1
 
 	# 如果用户没有输入目录，则使用默认目录
 	if [ -z "$input" ]; then
@@ -7182,7 +7197,7 @@ create_backup() {
 restore_backup() {
 	send_stats "恢复备份"
 	# 选择要恢复的备份
-	read -e -p "请输入要恢复的备份文件名: " BACKUP_NAME
+	read -e -p "请输入要恢复的备份文件名: " BACKUP_NAME || return 1
 
 	# 检查备份文件是否存在
 	if [ ! -f "$BACKUP_DIR/$BACKUP_NAME" ]; then
@@ -7211,7 +7226,7 @@ list_backups() {
 delete_backup() {
 	send_stats "删除备份"
 
-	read -e -p "请输入要删除的备份文件名: " BACKUP_NAME
+	read -e -p "请输入要删除的备份文件名: " BACKUP_NAME || return 1
 
 	# 检查备份文件是否存在
 	if [ ! -f "$BACKUP_DIR/$BACKUP_NAME" ]; then
@@ -7245,7 +7260,7 @@ linux_backup() {
 		echo "------------------------"
 		echo "0. 返回上一级选单"
 		echo "------------------------"
-		read -e -p "请输入你的选择: " choice
+		read -e -p "请输入你的选择: " choice || return 1
 		case $choice in
 			1) create_backup ;;
 			2) restore_backup ;;
@@ -7286,7 +7301,7 @@ kj_ssh_read_host_port() {
 	local default_port="${3:-22}"
 
 	while true; do
-		read -e -p "$host_prompt" KJ_SSH_HOST
+		read -e -p "$host_prompt" KJ_SSH_HOST || return 1
 		if kj_ssh_validate_host "$KJ_SSH_HOST"; then
 			break
 		fi
@@ -7294,7 +7309,7 @@ kj_ssh_read_host_port() {
 	done
 
 	while true; do
-		read -e -p "$port_prompt" KJ_SSH_PORT
+		read -e -p "$port_prompt" KJ_SSH_PORT || return 1
 		KJ_SSH_PORT=${KJ_SSH_PORT:-$default_port}
 		if kj_ssh_validate_port "$KJ_SSH_PORT"; then
 			break
@@ -7313,7 +7328,7 @@ kj_ssh_read_host_user_port() {
 	kj_ssh_read_host_port "$host_prompt" "$port_prompt" "$default_port"
 
 	while true; do
-		read -e -p "$user_prompt" KJ_SSH_USER
+		read -e -p "$user_prompt" KJ_SSH_USER || return 1
 		KJ_SSH_USER=${KJ_SSH_USER:-$default_user}
 		if kj_ssh_validate_user "$KJ_SSH_USER"; then
 			break
@@ -7357,11 +7372,11 @@ kj_ssh_read_auth() {
 	echo "请选择身份验证方式:"
 	echo "1. 密码"
 	echo "2. 密钥"
-	read -e -p "请输入选择 (1/2): " auth_choice
+	read -e -p "请输入选择 (1/2): " auth_choice || return 1
 
 	case $auth_choice in
 		1)
-			read -s -p "请输入密码: " password_or_key
+			read -s -p "请输入密码: " password_or_key || return 1
 			echo
 			if [ -z "$password_or_key" ]; then
 				echo "错误: 密码不能为空。"
@@ -7402,7 +7417,7 @@ kj_ssh_read_auth() {
 kj_ssh_read_password() {
 	local prompt="${1:-请输入密码: }"
 	while true; do
-		read -e -s -p "$prompt" KJ_SSH_PASSWORD
+		read -e -s -p "$prompt" KJ_SSH_PASSWORD || return 1
 		echo
 		[ -n "$KJ_SSH_PASSWORD" ] && break
 		echo "错误: 密码不能为空。"
@@ -7413,7 +7428,7 @@ kj_ssh_read_port() {
 	local port_prompt="$1"
 	local default_port="${2:-22}"
 	while true; do
-		read -e -p "$port_prompt" KJ_SSH_PORT
+		read -e -p "$port_prompt" KJ_SSH_PORT || return 1
 		KJ_SSH_PORT=${KJ_SSH_PORT:-$default_port}
 		if kj_ssh_validate_port "$KJ_SSH_PORT"; then
 			return 0
@@ -7440,7 +7455,7 @@ add_connection() {
 	echo "  - 用户名: root"
 	echo "  - 端口: 22"
 	echo "------------------------"
-	read -e -p "请输入连接名称: " name
+	read -e -p "请输入连接名称: " name || return 1
 
 	kj_ssh_read_host_user_port "请输入IP地址: " "请输入用户名 (默认: root): " "请输入端口号 (默认: 22): " "root" "22"
 	if ! kj_ssh_read_auth "$KEY_DIR/$name.key"; then
@@ -7456,7 +7471,7 @@ add_connection() {
 # 删除连接
 delete_connection() {
 	send_stats "删除连接"
-	read -e -p "请输入要删除的连接编号: " num
+	read -e -p "请输入要删除的连接编号: " num || return 1
 
 	local connection=$(sed -n "${num}p" "$CONFIG_FILE")
 	if [[ -z "$connection" ]]; then
@@ -7478,7 +7493,7 @@ delete_connection() {
 # 使用连接
 use_connection() {
 	send_stats "使用连接"
-	read -e -p "请输入要使用的连接编号: " num
+	read -e -p "请输入要使用的连接编号: " num || return 1
 
 	local connection=$(sed -n "${num}p" "$CONFIG_FILE")
 	if [[ -z "$connection" ]]; then
@@ -7544,7 +7559,7 @@ ssh_manager() {
 		echo "------------------------"
 		echo "0. 返回上一级选单"
 		echo "------------------------"
-		read -e -p "请输入你的选择: " choice
+		read -e -p "请输入你的选择: " choice || return 1
 		case $choice in
 			1) add_connection ;;
 			2) use_connection ;;
@@ -7576,7 +7591,7 @@ list_partitions() {
 # 持久化挂载分区
 mount_partition() {
 	send_stats "挂载分区"
-	read -e -p "请输入要挂载的分区名称（例如 sda1）: " PARTITION
+	read -e -p "请输入要挂载的分区名称（例如 sda1）: " PARTITION || return 1
 
 	DEVICE="/dev/$PARTITION"
 	MOUNT_POINT="/mnt/$PARTITION"
@@ -7620,7 +7635,7 @@ mount_partition() {
 	echo "分区已成功挂载到 $MOUNT_POINT"
 
 	# 检查 /etc/fstab 是否已经存在 UUID 或挂载点
-	if grep -qE "UUID=$UUID|[[:space:]]$MOUNT_POINT[[:space:]]" /etc/fstab; then
+	if awk -v uuid="UUID=$UUID" -v point="$MOUNT_POINT" '$1 == uuid || $2 == point {found=1} END {exit !found}' /etc/fstab; then
 		echo "/etc/fstab 中已存在该分区记录，跳过写入"
 		return 0
 	fi
@@ -7635,7 +7650,7 @@ mount_partition() {
 # 卸载分区
 unmount_partition() {
 	send_stats "卸载分区"
-	read -e -p "请输入要卸载的分区名称（例如 sda1）: " PARTITION
+	read -e -p "请输入要卸载的分区名称（例如 sda1）: " PARTITION || return 1
 
 	# 检查分区是否已经挂载
 	MOUNT_POINT=$(lsblk -o MOUNTPOINT | grep -w "$PARTITION")
@@ -7664,7 +7679,7 @@ list_mounted_partitions() {
 # 格式化分区
 format_partition() {
 	send_stats "格式化分区"
-	read -e -p "请输入要格式化的分区名称（例如 sda1）: " PARTITION
+	read -e -p "请输入要格式化的分区名称（例如 sda1）: " PARTITION || return 1
 
 	# 检查分区是否存在
 	if ! lsblk -o NAME | grep -w "$PARTITION" > /dev/null; then
@@ -7684,7 +7699,7 @@ format_partition() {
 	echo "2. xfs"
 	echo "3. ntfs"
 	echo "4. vfat"
-	read -e -p "请输入你的选择: " FS_CHOICE
+	read -e -p "请输入你的选择: " FS_CHOICE || return 1
 
 	case $FS_CHOICE in
 		1) FS_TYPE="ext4" ;;
@@ -7695,7 +7710,7 @@ format_partition() {
 	esac
 
 	# 确认格式化
-	read -e -p "确认格式化分区 /dev/$PARTITION 为 $FS_TYPE 吗？(y/n): " CONFIRM
+	read -e -p "确认格式化分区 /dev/$PARTITION 为 $FS_TYPE 吗？(y/n): " CONFIRM || return 1
 	if [ "$CONFIRM" != "y" ]; then
 		echo "操作已取消。"
 		return
@@ -7715,7 +7730,7 @@ format_partition() {
 # 检查分区状态
 check_partition() {
 	send_stats "检查分区状态"
-	read -e -p "请输入要检查的分区名称（例如 sda1）: " PARTITION
+	read -e -p "请输入要检查的分区名称（例如 sda1）: " PARTITION || return 1
 
 	# 检查分区是否存在
 	if ! lsblk -o NAME | grep -w "$PARTITION" > /dev/null; then
@@ -7743,7 +7758,7 @@ disk_manager() {
 		echo "------------------------"
 		echo "0. 返回上一级选单"
 		echo "------------------------"
-		read -e -p "请输入你的选择: " choice
+		read -e -p "请输入你的选择: " choice || return 1
 		case $choice in
 			1) mount_partition ;;
 			2) unmount_partition ;;
@@ -7777,12 +7792,12 @@ add_task() {
 	echo "  - 远程目录: /backup/www"
 	echo "  - 端口号 (默认 22)"
 	echo "---------------------------------"
-	read -e -p "请输入任务名称: " name
-	read -e -p "请输入本地目录: " local_path
-	read -e -p "请输入远程目录: " remote_path
+	read -e -p "请输入任务名称: " name || return 1
+	read -e -p "请输入本地目录: " local_path || return 1
+	read -e -p "请输入远程目录: " remote_path || return 1
 
 	while true; do
-		read -e -p "请输入远程用户@IP: " remote
+		read -e -p "请输入远程用户@IP: " remote || return 1
 		if kj_ssh_parse_remote "$remote" "root"; then
 			remote="$KJ_SSH_REMOTE"
 			break
@@ -7801,7 +7816,7 @@ add_task() {
 	echo "请选择同步模式:"
 	echo "1. 标准模式 (-avz)"
 	echo "2. 删除目标文件 (-avz --delete)"
-	read -e -p "请选择 (1/2): " mode
+	read -e -p "请选择 (1/2): " mode || return 1
 	case $mode in
 		1) options="-avz" ;;
 		2) options="-avz --delete" ;;
@@ -7819,7 +7834,7 @@ add_task() {
 # 删除任务
 delete_task() {
 	send_stats "删除同步任务"
-	read -e -p "请输入要删除的任务编号: " num
+	read -e -p "请输入要删除的任务编号: " num || return 1
 
 	local task=$(sed -n "${num}p" "$CONFIG_FILE")
 	if [[ -z "$task" ]]; then
@@ -7858,7 +7873,7 @@ run_task() {
 
 	# 如果没有传入任务编号，提示用户输入
 	if [[ -z "$num" ]]; then
-		read -e -p "请输入要执行的任务编号: " num
+		read -e -p "请输入要执行的任务编号: " num || return 1
 	fi
 
 	local task=$(sed -n "${num}p" "$CONFIG_FILE")
@@ -7923,7 +7938,7 @@ run_task() {
 schedule_task() {
 	send_stats "添加同步定时任务"
 
-	read -e -p "请输入要定时同步的任务编号: " num
+	read -e -p "请输入要定时同步的任务编号: " num || return 1
 	if ! [[ "$num" =~ ^[0-9]+$ ]]; then
 		echo "错误: 请输入有效的任务编号！"
 		return
@@ -7933,7 +7948,7 @@ schedule_task() {
 	echo "1) 每小时执行一次"
 	echo "2) 每天执行一次"
 	echo "3) 每周执行一次"
-	read -e -p "请输入选项 (1/2/3): " interval
+	read -e -p "请输入选项 (1/2/3): " interval || return 1
 
 	local random_minute=$(shuf -i 0-59 -n 1)  # 生成 0-59 之间的随机分钟数
 	local cron_time=""
@@ -7969,7 +7984,7 @@ view_tasks() {
 # 删除定时任务
 delete_task_schedule() {
 	send_stats "删除同步定时任务"
-	read -e -p "请输入要删除的任务编号: " num
+	read -e -p "请输入要删除的任务编号: " num || return 1
 	if ! [[ "$num" =~ ^[0-9]+$ ]]; then
 		echo "错误: 请输入有效的任务编号！"
 		return
@@ -8000,7 +8015,7 @@ rsync_manager() {
 		echo "---------------------------------"
 		echo "0. 返回上一级选单"
 		echo "---------------------------------"
-		read -e -p "请输入你的选择: " choice
+		read -e -p "请输入你的选择: " choice || return 1
 		case $choice in
 			1) add_task ;;
 			2) delete_task ;;
@@ -8477,7 +8492,7 @@ daimon_network_show_other_bbr_configs() {
 }
 
 daimon_network_enable_bbr_fq() {
-	local tmp old_conf="" old_cc old_qdisc
+	local tmp old_conf="" old_cc old_qdisc rollback_failed=0
 	if ! daimon_network_bbr_supported; then
 		echo -e "${gl_hong}当前内核不支持 BBR，未写入任何 BBR/FQ 配置。${gl_bai}"
 		echo "请进入主菜单 13 的 BBR 管理，明确选择并安装适合当前系统的内核。"
@@ -8485,39 +8500,40 @@ daimon_network_enable_bbr_fq() {
 	fi
 	daimon_network_verify_active_fq || return 1
 
-	old_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
-	old_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || true)
-	mkdir -p /etc/sysctl.d /etc/modules-load.d
+	old_cc=$(sysctl -n net.ipv4.tcp_congestion_control) || return 1
+	old_qdisc=$(sysctl -n net.core.default_qdisc) || return 1
+	mkdir -p /etc/sysctl.d || return 1
 	tmp=$(mktemp) || return 1
 	if [ -f "$DAIMON_BBR_FQ_CONF" ]; then
 		old_conf=$(mktemp) || { rm -f "$tmp"; return 1; }
-		cp -a "$DAIMON_BBR_FQ_CONF" "$old_conf"
+		cp -a "$DAIMON_BBR_FQ_CONF" "$old_conf" || { rm -f "$tmp" "$old_conf"; return 1; }
 	fi
 	cat > "$tmp" <<'EOF'
 # linux-tools-daimon BBR + FQ
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 EOF
-	if ! command install -m 644 "$tmp" "$DAIMON_BBR_FQ_CONF"; then
+	if command install -m 644 "$tmp" "$DAIMON_BBR_FQ_CONF" &&
+		sysctl -p "$DAIMON_BBR_FQ_CONF" >/dev/null 2>&1 && daimon_network_verify_bbr_fq; then
 		rm -f "$tmp" "$old_conf"
-		return 1
+		return 0
 	fi
 	rm -f "$tmp"
 
-	if sysctl -p "$DAIMON_BBR_FQ_CONF" >/dev/null 2>&1 && daimon_network_verify_bbr_fq; then
-		rm -f "$old_conf"
-		return 0
-	fi
-
 	if [ -n "$old_conf" ]; then
-		cp -a "$old_conf" "$DAIMON_BBR_FQ_CONF"
+		cp -a "$old_conf" "$DAIMON_BBR_FQ_CONF" || rollback_failed=1
 	else
-		rm -f "$DAIMON_BBR_FQ_CONF"
+		rm -f "$DAIMON_BBR_FQ_CONF" || rollback_failed=1
 	fi
-	rm -f "$old_conf"
-	[ -n "$old_qdisc" ] && sysctl -w "net.core.default_qdisc=$old_qdisc" >/dev/null 2>&1 || true
-	[ -n "$old_cc" ] && sysctl -w "net.ipv4.tcp_congestion_control=$old_cc" >/dev/null 2>&1 || true
-	echo -e "${gl_hong}BBR + FQ 应用后验证失败，已恢复原配置。${gl_bai}"
+	sysctl -w "net.core.default_qdisc=$old_qdisc" "net.ipv4.tcp_congestion_control=$old_cc" >/dev/null || rollback_failed=1
+	[ "$(sysctl -n net.core.default_qdisc)" = "$old_qdisc" ] || rollback_failed=1
+	[ "$(sysctl -n net.ipv4.tcp_congestion_control)" = "$old_cc" ] || rollback_failed=1
+	if [ "$rollback_failed" -eq 0 ]; then
+		rm -f "$old_conf"
+		echo -e "${gl_hong}BBR + FQ 验证失败，原配置和运行态已恢复。${gl_bai}"
+	else
+		echo -e "${gl_hong}BBR + FQ 回滚不完整；原配置备份: ${old_conf:-无}；原算法: $old_cc；原队列: $old_qdisc${gl_bai}"
+	fi
 	daimon_network_show_other_bbr_configs
 	return 1
 }
@@ -8853,7 +8869,7 @@ one_click_config_manager() {
 		export NEEDRESTART_MODE=a
 		export APT_LISTCHANGES_FRONTEND=none
 		nums="2 3 4 5 6 7 8 9 10"
-		read -e -i "$nums" -p "请确认/修改要执行的配置编号（默认全选，空格分隔）: " nums
+		read -e -i "$nums" -p "请确认/修改要执行的配置编号（默认全选，空格分隔）: " nums || return 1
 		if [ -z "$nums" ]; then
 			echo "未选择任何配置项"
 			return
@@ -8880,7 +8896,7 @@ one_click_config_manager() {
 		echo -e "${gl_kjlan}10.  ${gl_bai}修改时区和本地语言（Asia/Shanghai + en_US.UTF-8）"
 		echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
 		echo "------------------------"
-		read -e -p "请输入你的选择（默认 1 配置全部）: " sub_choice
+		read -e -p "请输入你的选择（默认 1 配置全部）: " sub_choice || return 1
 		case "$sub_choice" in
 			""|1) one_click_config_run_all ;;
 			2|3|4|5|6|7|8|9|10) one_click_config_run_item "$sub_choice" ;;
@@ -8924,7 +8940,7 @@ EOF
 	echo "导入公钥示例："
 	echo "  URL：      ${gh_https_url}github.com/torvalds.keys"
 	echo "  直接粘贴： ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI..."
-	read -e -p "请输入 ${new_username} 的公钥（可留空跳过）: " sshkey_vl
+	read -e -p "请输入 ${new_username} 的公钥（可留空跳过）: " sshkey_vl || return 1
 	[ -z "$sshkey_vl" ] && return 0
 
 	local user_home="/home/$new_username"
@@ -8969,12 +8985,12 @@ env_menu() {
 
 	add_env_var() {
 		local name value target
-		read -e -p "变量名（如 JAVA_HOME）: " name
+		read -e -p "变量名（如 JAVA_HOME）: " name || return 1
 		[ -z "$name" ] && return
-		read -e -p "变量值: " value
+		read -e -p "变量值: " value || return 1
 		echo "1. 写入 ~/.bashrc（默认）"
 		echo "2. 写入 ~/.profile"
-		read -e -p "请选择写入位置: " target
+		read -e -p "请选择写入位置: " target || return 1
 		local file="$bashrc_file"
 		[ "$target" = "2" ] && file="$profile_file"
 		touch "$file"
@@ -8987,7 +9003,7 @@ env_menu() {
 
 	delete_env_var() {
 		local name
-		read -e -p "请输入要删除的变量名: " name
+		read -e -p "请输入要删除的变量名: " name || return 1
 		[ -z "$name" ] && return
 		sed -i "/^export ${name}=/d" "$bashrc_file" "$profile_file" 2>/dev/null || true
 		unset "$name"
@@ -9005,7 +9021,7 @@ env_menu() {
 		echo "3. 删除环境变量"
 		echo "0. 返回上一级选单"
 		echo "------------------------------------------------"
-		read -e -p "请输入你的选择: " choice
+		read -e -p "请输入你的选择: " choice || return 1
 		case "$choice" in
 			1) show_env_vars ;;
 			2) add_env_var ;;
@@ -9050,8 +9066,8 @@ github_proxy_add_source() {
 	github_proxy_init_sources
 	local name url file
 	file=$(github_proxy_sources_file)
-	read -e -p "请输入镜像名称: " name
-	read -e -p "请输入测速URL: " url
+	read -e -p "请输入镜像名称: " name || return 1
+	read -e -p "请输入测速URL: " url || return 1
 	[ -z "$name" ] || [ -z "$url" ] && echo "名称和URL不能为空" && return 1
 	sed -i "/^${name//\//\\/}|/d" "$file"
 	echo "$name|$url" >> "$file"
@@ -9063,7 +9079,7 @@ github_proxy_delete_source() {
 	local file num tmp
 	file=$(github_proxy_sources_file)
 	github_proxy_show_sources
-	read -e -p "请输入要删除的编号: " num
+	read -e -p "请输入要删除的编号: " num || return 1
 	[[ "$num" =~ ^[0-9]+$ ]] || return 1
 	tmp=$(mktemp)
 	awk -F'|' -v n="$num" 'NF && ++i != n {print}' "$file" > "$tmp"
@@ -9118,7 +9134,7 @@ github_proxy_manager() {
 		echo "3. 测速"
 		echo "0. 返回上一级选单"
 		echo "------------------------------------------------"
-		read -e -p "请输入你的选择: " choice
+		read -e -p "请输入你的选择: " choice || return 1
 		case "$choice" in
 			1) github_proxy_add_source ;;
 			2) github_proxy_delete_source ;;
@@ -9164,10 +9180,13 @@ show_ssh_ip_info() {
 
 net_menu() {
 	show_nics() {
+		local path nic state ipaddr mac
 		echo "================ 当前网卡信息 ================"
 		printf "%-18s %-12s %-22s %-20s\n" "网卡名" "状态" "IPv4地址" "MAC地址"
 		echo "------------------------------------------------"
-		for nic in $(ls /sys/class/net 2>/dev/null); do
+		for path in /sys/class/net/*; do
+			[ -e "$path" ] || continue
+			nic=${path##*/}
 			state=$(cat "/sys/class/net/$nic/operstate" 2>/dev/null)
 			ipaddr=$(ip -4 addr show "$nic" 2>/dev/null | awk '/inet /{print $2}' | head -n1)
 			mac=$(cat "/sys/class/net/$nic/address" 2>/dev/null)
@@ -9186,11 +9205,11 @@ net_menu() {
 		echo "4. 刷新网卡信息"
 		echo "0. 返回上一级选单"
 		echo "===================================="
-		read -e -p "请输入你的选择: " choice
+		read -e -p "请输入你的选择: " choice || return 1
 		case "$choice" in
-			1) read -e -p "请输入网卡名: " nic; [ -n "$nic" ] && ip link set "$nic" up ;;
-			2) read -e -p "请输入网卡名: " nic; [ -n "$nic" ] && ip link set "$nic" down ;;
-			3) read -e -p "请输入网卡名: " nic; [ -n "$nic" ] && { ip addr show "$nic"; echo; ethtool "$nic" 2>/dev/null || true; } ;;
+			1) read -e -p "请输入网卡名: " nic || return 1; [ -n "$nic" ] && ip link set "$nic" up ;;
+			2) read -e -p "请输入网卡名: " nic || return 1; [ -n "$nic" ] && ip link set "$nic" down ;;
+			3) read -e -p "请输入网卡名: " nic || return 1; [ -n "$nic" ] && { ip addr show "$nic"; echo; ethtool "$nic" 2>/dev/null || true; } ;;
 			4) continue ;;
 			0) return ;;
 			*) echo "无效的输入!" ;;
@@ -9213,17 +9232,17 @@ journalctl_log_manager() {
 		echo "5. 按大小保留日志（默认500M）"
 		echo "0. 返回上一级菜单"
 		echo "------------------------------------------------"
-		read -e -p "请输入你的选择: " choice
+		read -e -p "请输入你的选择: " choice || return 1
 		case "$choice" in
 			1)
 				local system_max_use system_keep_free system_max_file_size max_retention_sec
-				read -e -p "SystemMaxUse 最大总占用（默认 500M）: " system_max_use
+				read -e -p "SystemMaxUse 最大总占用（默认 500M）: " system_max_use || return 1
 				system_max_use=${system_max_use:-500M}
-				read -e -p "SystemKeepFree 系统至少保留空闲空间（默认 1G）: " system_keep_free
+				read -e -p "SystemKeepFree 系统至少保留空闲空间（默认 1G）: " system_keep_free || return 1
 				system_keep_free=${system_keep_free:-1G}
-				read -e -p "SystemMaxFileSize 单个 journal 文件最大大小（默认 50M）: " system_max_file_size
+				read -e -p "SystemMaxFileSize 单个 journal 文件最大大小（默认 50M）: " system_max_file_size || return 1
 				system_max_file_size=${system_max_file_size:-50M}
-				read -e -p "MaxRetentionSec 最长保留时间（默认 1month）: " max_retention_sec
+				read -e -p "MaxRetentionSec 最长保留时间（默认 1month）: " max_retention_sec || return 1
 				max_retention_sec=${max_retention_sec:-1month}
 				mkdir -p /etc/systemd/journald.conf.d
 				cat > /etc/systemd/journald.conf.d/99-daimon-journal.conf <<EOF
@@ -9237,9 +9256,9 @@ EOF
 				echo "已写入 /etc/systemd/journald.conf.d/99-daimon-journal.conf"
 				;;
 			2) journalctl --disk-usage ;;
-			3) read -e -p "请输入服务名（可不带 .service）: " svc; [ -z "$svc" ] && continue; [[ "$svc" != *.service ]] && svc="$svc.service"; journalctl -u "$svc" -n 200 --no-pager ;;
-			4) read -e -p "保留时间（默认 7d）: " t; journalctl --vacuum-time="${t:-7d}" ;;
-			5) read -e -p "保留大小（默认 500M）: " z; journalctl --vacuum-size="${z:-500M}" ;;
+			3) read -e -p "请输入服务名（可不带 .service）: " svc || return 1; [ -z "$svc" ] && continue; [[ "$svc" != *.service ]] && svc="$svc.service"; journalctl -u "$svc" -n 200 --no-pager ;;
+			4) read -e -p "保留时间（默认 7d）: " t || return 1; journalctl --vacuum-time="${t:-7d}" ;;
+			5) read -e -p "保留大小（默认 500M）: " z || return 1; journalctl --vacuum-size="${z:-500M}" ;;
 			0) return ;;
 			*) echo "无效的输入!" ;;
 		esac
@@ -9276,13 +9295,13 @@ system_network_auto_optimize() {
 		echo "3. 清除自定义网络优化"
 		echo "0. 返回上一级菜单"
 		echo "------------------------------------------------"
-		read -e -p "请输入你的选择: " choice
+		read -e -p "请输入你的选择: " choice || return 1
 		case "$choice" in
 			1)
 				daimon_network_apply_custom_optimize
 				status=$?
 				if [ "$status" -eq 2 ]; then
-					read -e -p "是否进入 BBR 管理选择兼容内核？[y/N]: " open_bbr
+					read -e -p "是否进入 BBR 管理选择兼容内核？[y/N]: " open_bbr || return 1
 					case "$open_bbr" in [Yy]) linux_bbr ;; esac
 				fi
 				;;
@@ -9354,7 +9373,7 @@ cpcat_manager() {
 		echo "2. 删除 ~/.bashrc 中的 cpcat 配置"
 		echo "0. 返回上一级菜单"
 		echo "------------------------------------------------"
-		read -e -p "请输入你的选择: " cpcat_choice
+		read -e -p "请输入你的选择: " cpcat_choice || return 1
 		case "$cpcat_choice" in
 			1)
 				local tmp_file
@@ -9418,13 +9437,13 @@ linux_Settings() {
 		echo -e "${gl_kjlan}------------------------"
 		echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
 		echo -e "${gl_kjlan}------------------------${gl_bai}"
-		read -e -p "请输入你的选择: " sub_choice
+		read -e -p "请输入你的选择: " sub_choice || return 1
 
 		case "$sub_choice" in
 			1)
 				while true; do
 					clear
-					read -e -p "请输入你的快捷按键（默认 d，输入0退出）: " kuaijiejian
+					read -e -p "请输入你的快捷按键（默认 d，输入0退出）: " kuaijiejian || return 1
 					kuaijiejian=${kuaijiejian:-d}
 					[ "$kuaijiejian" = "0" ] && break
 					find /usr/local/bin/ -type l -exec bash -c 'test "$(readlink -f {})" = "/usr/local/bin/d" && rm -f {}' \; 2>/dev/null || true
@@ -9463,7 +9482,7 @@ linux_Settings() {
 					echo "------------------------"
 					echo "0. 返回上一级选单"
 					echo "------------------------"
-					read -e -p "选择优先的网络: " choice
+					read -e -p "选择优先的网络: " choice || return 1
 					case "$choice" in
 						1) prefer_ipv4 ;;
 						2) rm -f /etc/gai.conf; echo "已切换为 IPv6 优先"; send_stats "已切换为 IPv6 优先" ;;
@@ -9491,12 +9510,12 @@ linux_Settings() {
 					echo "------------------------"
 					echo "0. 返回上一级选单"
 					echo "------------------------"
-					read -e -p "请输入你的选择: " choice
+					read -e -p "请输入你的选择: " choice || return 1
 					case "$choice" in
 						1) send_stats "已设置1G虚拟内存"; add_swap 1024 ;;
 						2) send_stats "已设置2G虚拟内存"; add_swap 2048 ;;
 						3) send_stats "已设置4G虚拟内存"; add_swap 4096 ;;
-						4) read -e -p "请输入虚拟内存大小（单位M）: " new_swap; [ -n "$new_swap" ] && add_swap "$new_swap"; send_stats "已设置自定义虚拟内存" ;;
+						4) read -e -p "请输入虚拟内存大小（单位M）: " new_swap || return 1; [ -n "$new_swap" ] && add_swap "$new_swap"; send_stats "已设置自定义虚拟内存" ;;
 						5) send_stats "删除虚拟内存"; delete_swap ;;
 						0) break ;;
 						*) echo "无效的输入!" ;;
@@ -9534,13 +9553,13 @@ linux_Settings() {
 					echo "------------------------"
 					echo "0. 返回上一级选单"
 					echo "------------------------"
-					read -e -p "请输入你的选择: " choice
+					read -e -p "请输入你的选择: " choice || return 1
 					case "$choice" in
-						1) read -e -p "请输入新用户名: " new_username; [ -n "$new_username" ] && create_user_with_sshkey "$new_username" false ;;
-						2) read -e -p "请输入新用户名: " new_username; [ -n "$new_username" ] && create_user_with_sshkey "$new_username" true ;;
-						3) read -e -p "请输入用户名: " username; [ -n "$username" ] && { install sudo; usermod -aG sudo "$username" 2>/dev/null || true; echo "$username ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/$username"; chmod 440 "/etc/sudoers.d/$username"; } ;;
-						4) read -e -p "请输入用户名: " username; [ -n "$username" ] && { rm -f "/etc/sudoers.d/$username"; sed -i "/^$username\s*ALL=(ALL)/d" /etc/sudoers 2>/dev/null || true; gpasswd -d "$username" sudo 2>/dev/null || true; } ;;
-						5) read -e -p "请输入要删除的用户名: " username; [ -n "$username" ] && userdel -r "$username" ;;
+						1) read -e -p "请输入新用户名: " new_username || return 1; [ -n "$new_username" ] && create_user_with_sshkey "$new_username" false ;;
+						2) read -e -p "请输入新用户名: " new_username || return 1; [ -n "$new_username" ] && create_user_with_sshkey "$new_username" true ;;
+						3) read -e -p "请输入用户名: " username || return 1; [ -n "$username" ] && { install sudo; usermod -aG sudo "$username" 2>/dev/null || true; echo "$username ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/$username"; chmod 440 "/etc/sudoers.d/$username"; } ;;
+						4) read -e -p "请输入用户名: " username || return 1; [ -n "$username" ] && { rm -f "/etc/sudoers.d/$username"; sed -i "/^$username\s*ALL=(ALL)/d" /etc/sudoers 2>/dev/null || true; gpasswd -d "$username" sudo 2>/dev/null || true; } ;;
+						5) read -e -p "请输入要删除的用户名: " username || return 1; [ -n "$username" ] && userdel -r "$username" ;;
 						0) break ;;
 						*) echo "无效的输入!" ;;
 					esac
@@ -9582,7 +9601,7 @@ linux_Settings() {
 					echo "------------------------"
 					echo "0. 返回上一级选单"
 					echo "------------------------"
-					read -e -p "请输入你的选择: " choice
+					read -e -p "请输入你的选择: " choice || return 1
 					case "$choice" in
 						1) set_timedate Asia/Shanghai ;;
 						2) set_timedate Asia/Hong_Kong ;;
@@ -9621,7 +9640,7 @@ linux_Settings() {
 					current_hostname=$(uname -n)
 					echo -e "当前主机名: ${gl_huang}$current_hostname${gl_bai}"
 					echo "------------------------"
-					read -e -p "请输入新的主机名（输入0退出）: " new_hostname
+					read -e -p "请输入新的主机名（输入0退出）: " new_hostname || return 1
 					if [ -n "$new_hostname" ] && [ "$new_hostname" != "0" ]; then
 						if [ -f /etc/alpine-release ]; then
 							echo "$new_hostname" > /etc/hostname
@@ -9664,10 +9683,10 @@ linux_Settings() {
 					echo "------------------------"
 					echo "0. 返回上一级选单"
 					echo "------------------------"
-					read -e -p "请输入你的选择: " host_dns
+					read -e -p "请输入你的选择: " host_dns || return 1
 					case "$host_dns" in
-						1) read -e -p "请输入新的解析记录 格式: 110.25.5.33 example.com : " addhost; [ -n "$addhost" ] && echo "$addhost" >> /etc/hosts; send_stats "本地host解析新增" ;;
-						2) read -e -p "请输入需要删除的解析内容关键字: " delhost; [ -n "$delhost" ] && sed -i "/$delhost/d" /etc/hosts; send_stats "本地host解析删除" ;;
+						1) read -e -p "请输入新的解析记录 格式: 110.25.5.33 example.com : " addhost || return 1; [ -n "$addhost" ] && echo "$addhost" >> /etc/hosts; send_stats "本地host解析新增" ;;
+						2) read -e -p "请输入需要删除的解析内容关键字: " delhost || return 1; [ -n "$delhost" ] && sed -i "/$delhost/d" /etc/hosts; send_stats "本地host解析删除" ;;
 						0) break ;;
 						*) echo "无效的输入!" ;;
 					esac
@@ -9690,7 +9709,7 @@ linux_Settings() {
 				echo "卸载daimon脚本"
 				echo "------------------------------------------------"
 				echo "将彻底卸载daimon脚本，不影响你其他功能"
-				read -e -p "确定继续吗？(Y/N): " choice
+				read -e -p "确定继续吗？(Y/N): " choice || return 1
 				case "$choice" in
 					[Yy])
 						clear
@@ -11033,7 +11052,7 @@ EOF
       nexttrace)
         install_nexttrace
         ;;
-      git|curl|tree|npm|wget|sudo|socat|htop|iftop|unzip|tar|tmux|ffmpeg|btop|ncdu|iperf3)
+      git|curl|tree|wget|sudo|socat|htop|iftop|unzip|tar|tmux|ffmpeg|btop|ncdu|iperf3)
         install "$id"
         command -v "$id" >/dev/null 2>&1 && "$id" --version 2>/dev/null | head -n 1 || true
         ;;
@@ -11096,8 +11115,9 @@ EOF
     local input="$2"
     local n id failed=0
     for n in $input; do
-      if ! [[ "$n" =~ ^[0-9]+$ ]] || [ "$n" -lt 1 ] || [ "$n" -gt ${#tool_ids[@]} ]; then
+      if ! [[ "$n" =~ ^[0-9]{1,3}$ ]] || [ "$n" -lt 1 ] || [ "$n" -gt ${#tool_ids[@]} ]; then
         echo "跳过无效编号: $n"
+        failed=1
         continue
       fi
       id="${tool_ids[$((10#$n-1))]}"
@@ -11152,25 +11172,25 @@ EOF
       echo -e "${gl_kjlan}4.   ${gl_bai}全部卸载"
       echo -e "${gl_kjlan}0.   ${gl_bai}返回上一级菜单"
       echo -e "${gl_kjlan}------------------------${gl_bai}"
-      read -e -p "请输入你的选择: " sub_choice
+      read -e -p "请输入你的选择: " sub_choice || return 1
       case $sub_choice in
         1)
-          read -e -p "请输入要安装的工具编号（支持多选，空格分隔）: " nums
+          read -e -p "请输入要安装的工具编号（支持多选，空格分隔）: " nums || return 1
           handle_tool_numbers install "$nums" && [ -n "$nums" ] && restart_shell_after_tool_install
           ;;
         2)
-          read -e -p "请输入要卸载的工具编号（支持多选，空格分隔）: " nums
+          read -e -p "请输入要卸载的工具编号（支持多选，空格分隔）: " nums || return 1
           handle_tool_numbers remove "$nums"
           ;;
         3)
           nums="$(all_tool_numbers)"
-          read -e -i "$nums" -p "请确认/修改要安装的工具编号（默认全选，空格分隔）: " nums
+          read -e -i "$nums" -p "请确认/修改要安装的工具编号（默认全选，空格分隔）: " nums || return 1
           handle_tool_numbers install "$nums" && [ -n "$nums" ] && restart_shell_after_tool_install
           ;;
         4)
           nums="$(all_tool_numbers)"
-          read -e -i "$nums" -p "请确认/修改要卸载的工具编号（默认全选，空格分隔）: " nums
-          read -e -p "确认卸载以上编号对应工具？(y/N): " confirm
+          read -e -i "$nums" -p "请确认/修改要卸载的工具编号（默认全选，空格分隔）: " nums || return 1
+          read -e -p "确认卸载以上编号对应工具？(y/N): " confirm || return 1
           if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
             handle_tool_numbers remove "$nums"
           else
@@ -11214,7 +11234,7 @@ EOF
     echo -e "${gl_kjlan}2.   ${gl_bai}编程工具"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
-    read -e -p "请输入你的选择: " sub_choice
+    read -e -p "请输入你的选择: " sub_choice || return 1
     case $sub_choice in
       1) tool_category_menu thirdparty "第三方工具" ;;
       2) tool_category_menu programming "编程工具" ;;
@@ -11280,7 +11300,7 @@ docker_ssh_migration() {
 
 		echo -e "${gl_kjlan}正在备份 Docker 容器...${gl_bai}"
 		docker ps --format '{{.Names}}'
-		read -e -p  "请输入要备份的容器名（多个空格分隔，回车备份全部运行中容器）: " containers
+		read -e -p  "请输入要备份的容器名（多个空格分隔，回车备份全部运行中容器）: " containers || return 1
 
 		install tar jq gzip
 		install_docker
@@ -11318,7 +11338,7 @@ docker_ssh_migration() {
 				local project_name=$(docker inspect "$c" | jq -r '.[0].Config.Labels["com.docker.compose.project"] // empty')
 
 				if [ -z "$project_dir" ]; then
-					read -e -p  "未检测到 compose 目录，请手动输入路径: " project_dir
+					read -e -p  "未检测到 compose 目录，请手动输入路径: " project_dir || return 1
 				fi
 
 				# 如果该 Compose 项目已经打包过，跳过
@@ -11391,7 +11411,7 @@ docker_ssh_migration() {
 	docker_migration_restore() {
 
 		send_stats "Docker还原"
-		read -e -p  "请输入要还原的备份目录: " BACKUP_DIR
+		read -e -p  "请输入要还原的备份目录: " BACKUP_DIR || return 1
 		[[ ! -d "$BACKUP_DIR" || "$BACKUP_DIR" != /tmp/docker_backup_* ]] && { echo -e "${gl_hong}备份目录不存在或路径不受支持${gl_bai}"; return; }
 
 		echo -e "${gl_kjlan}开始执行还原操作...${gl_bai}"
@@ -11415,7 +11435,7 @@ docker_ssh_migration() {
 					continue
 				fi
 
-				read -e -p  "确认还原 Compose 项目 [$project_name] 到路径 [$original_path] ? (y/n): " confirm
+				read -e -p  "确认还原 Compose 项目 [$project_name] 到路径 [$original_path] ? (y/n): " confirm || return 1
 				[[ "$confirm" != "y" ]] && read -e -p  "请输入新的还原路径: " original_path
 
 				mkdir -p "$original_path"
@@ -11516,7 +11536,7 @@ docker_ssh_migration() {
 	docker_migration_migrate() {
 		send_stats "Docker迁移"
 		install jq
-		read -e -p  "请输入要迁移的备份目录: " BACKUP_DIR
+		read -e -p  "请输入要迁移的备份目录: " BACKUP_DIR || return 1
 			[[ ! -d "$BACKUP_DIR" || "$BACKUP_DIR" != /tmp/docker_backup_* ]] && { echo -e "${gl_hong}备份目录不存在或路径不受支持${gl_bai}"; return; }
 
 		kj_ssh_read_host_user_port "目标服务器IP: " "目标服务器SSH用户名 [默认root]: " "目标服务器SSH端口 [默认22]: " "root" "22"
@@ -11542,9 +11562,9 @@ docker_ssh_migration() {
 	# ----------------------------
 	docker_migration_delete_backup() {
 		send_stats "Docker备份文件删除"
-		read -e -p  "请输入要删除的备份目录: " BACKUP_DIR
+		read -e -p  "请输入要删除的备份目录: " BACKUP_DIR || return 1
 		[[ ! -d "$BACKUP_DIR" || "$BACKUP_DIR" != /tmp/docker_backup_* ]] && { echo -e "${gl_hong}备份目录不存在或路径不受支持${gl_bai}"; return; }
-		read -e -p "确认删除 $BACKUP_DIR？[y/N]: " confirm
+		read -e -p "确认删除 $BACKUP_DIR？[y/N]: " confirm || return 1
 		[[ "$confirm" != "y" && "$confirm" != "Y" ]] && return 0
 		rm -rf "$BACKUP_DIR"
 		echo -e "${gl_lv}已删除备份: ${BACKUP_DIR}${gl_bai}"
@@ -11570,7 +11590,7 @@ docker_ssh_migration() {
 			echo "------------------------"
 			echo -e "0. 返回上一级选单"
 			echo "------------------------"
-			read -e -p  "请选择: " choice
+			read -e -p  "请选择: " choice || return 1
 			case $choice in
 				1) docker_migration_backup ;;
 				2) docker_migration_migrate ;;
@@ -12094,7 +12114,7 @@ docker_compose_update_cleanup_orphans() {
 		echo -e "${gl_lv}没有失效任务。${gl_bai}"
 		return 0
 	fi
-	read -e -p "确认删除以上 ${#orphan_files[@]} 个失效任务？(y/N): " confirm
+	read -e -p "确认删除以上 ${#orphan_files[@]} 个失效任务？(y/N): " confirm || return 1
 	if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
 		echo "已取消"
 		return 0
@@ -12154,27 +12174,27 @@ docker_compose_auto_update_manager() {
 		echo -e "${gl_kjlan}5.   ${gl_bai}清理失效或已删除项目的任务"
 		echo -e "${gl_kjlan}0.   ${gl_bai}返回上一级菜单"
 		echo -e "${gl_kjlan}------------------------${gl_bai}"
-		read -e -p "请输入你的选择: " sub_choice
+		read -e -p "请输入你的选择: " sub_choice || return 1
 		case "$sub_choice" in
 			1)
-				read -e -p "请输入要安装自动更新的项目编号（支持多选，空格分隔）: " nums
+				read -e -p "请输入要安装自动更新的项目编号（支持多选，空格分隔）: " nums || return 1
 				docker_compose_update_handle_numbers install "$nums"
 				;;
 			2)
-				read -e -p "请输入要卸载自动更新的项目编号（支持多选，空格分隔）: " nums
+				read -e -p "请输入要卸载自动更新的项目编号（支持多选，空格分隔）: " nums || return 1
 				docker_compose_update_handle_numbers remove "$nums"
 				;;
 			3)
 				local nums
 				nums="$(docker_compose_update_all_numbers)"
-				read -e -i "$nums" -p "请确认/修改要安装的项目编号（默认全选，空格分隔）: " nums
+				read -e -i "$nums" -p "请确认/修改要安装的项目编号（默认全选，空格分隔）: " nums || return 1
 				docker_compose_update_handle_numbers install "$nums"
 				;;
 			4)
 				local nums
 				nums="$(docker_compose_update_all_numbers)"
-				read -e -i "$nums" -p "请确认/修改要卸载的项目编号（默认全选，空格分隔）: " nums
-				read -e -p "确认卸载以上编号对应自动更新？(y/N): " confirm
+				read -e -i "$nums" -p "请确认/修改要卸载的项目编号（默认全选，空格分隔）: " nums || return 1
+				read -e -p "确认卸载以上编号对应自动更新？(y/N): " confirm || return 1
 				if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
 					docker_compose_update_handle_numbers remove "$nums"
 				else
@@ -12222,7 +12242,7 @@ linux_docker() {
 	  echo -e "${gl_kjlan}------------------------"
 	  echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
 	  echo -e "${gl_kjlan}------------------------${gl_bai}"
-	  read -e -p "请输入你的选择: " sub_choice
+	  read -e -p "请输入你的选择: " sub_choice || return 1
 
 	  case $sub_choice in
 		  1)
@@ -12304,18 +12324,18 @@ linux_docker() {
 				  echo "------------------------"
 				  echo "0. 返回上一级选单"
 				  echo "------------------------"
-				  read -e -p "请输入你的选择: " sub_choice
+				  read -e -p "请输入你的选择: " sub_choice || return 1
 
 				  case $sub_choice in
 					  1)
 						  send_stats "创建网络"
-						  read -e -p "设置新网络名: " dockernetwork
+						  read -e -p "设置新网络名: " dockernetwork || return 1
 						  docker network create $dockernetwork
 						  ;;
 					  2)
 						  send_stats "加入网络"
-						  read -e -p "加入网络名: " dockernetwork
-						  read -e -p "那些容器加入该网络（多个容器名请用空格分隔）: " dockernames
+						  read -e -p "加入网络名: " dockernetwork || return 1
+						  read -e -p "那些容器加入该网络（多个容器名请用空格分隔）: " dockernames || return 1
 
 						  for dockername in $dockernames; do
 							  docker network connect $dockernetwork $dockername
@@ -12323,8 +12343,8 @@ linux_docker() {
 						  ;;
 					  3)
 						  send_stats "加入网络"
-						  read -e -p "退出网络名: " dockernetwork
-						  read -e -p "那些容器退出该网络（多个容器名请用空格分隔）: " dockernames
+						  read -e -p "退出网络名: " dockernetwork || return 1
+						  read -e -p "那些容器退出该网络（多个容器名请用空格分隔）: " dockernames || return 1
 
 						  for dockername in $dockernames; do
 							  docker network disconnect $dockernetwork $dockername
@@ -12334,7 +12354,7 @@ linux_docker() {
 
 					  4)
 						  send_stats "删除网络"
-						  read -e -p "请输入要删除的网络名: " dockernetwork
+						  read -e -p "请输入要删除的网络名: " dockernetwork || return 1
 						  docker network rm $dockernetwork
 						  ;;
 
@@ -12363,17 +12383,17 @@ linux_docker() {
 				  echo "------------------------"
 				  echo "0. 返回上一级选单"
 				  echo "------------------------"
-				  read -e -p "请输入你的选择: " sub_choice
+				  read -e -p "请输入你的选择: " sub_choice || return 1
 
 				  case $sub_choice in
 					  1)
 						  send_stats "新建卷"
-						  read -e -p "设置新卷名: " dockerjuan
+						  read -e -p "设置新卷名: " dockerjuan || return 1
 						  docker volume create $dockerjuan
 
 						  ;;
 					  2)
-						  read -e -p "输入删除卷名（多个卷名请用空格分隔）: " dockerjuans
+						  read -e -p "输入删除卷名（多个卷名请用空格分隔）: " dockerjuans || return 1
 
 						  for dockerjuan in $dockerjuans; do
 							  docker volume rm $dockerjuan
@@ -12383,7 +12403,7 @@ linux_docker() {
 
 					   3)
 						  send_stats "删除所有卷"
-						  read -e -p "$(echo -e "${gl_hong}注意: ${gl_bai}确定删除所有未使用的卷吗？(Y/N): ")" choice
+						  read -e -p "$(echo -e "${gl_hong}注意: ${gl_bai}确定删除所有未使用的卷吗？(Y/N): ")" choice || return 1
 						  case "$choice" in
 							[Yy])
 							  docker volume prune -f
@@ -12408,7 +12428,7 @@ linux_docker() {
 		  7)
 			  clear
 			  send_stats "Docker清理"
-			  read -e -p "$(echo -e "${gl_huang}提示: ${gl_bai}将清理无用的镜像容器网络，包括停止的容器，确定清理吗？(Y/N): ")" choice
+			  read -e -p "$(echo -e "${gl_huang}提示: ${gl_bai}将清理无用的镜像容器网络，包括停止的容器，确定清理吗？(Y/N): ")" choice || return 1
 			  case "$choice" in
 				[Yy])
 				  docker system prune -af --volumes
@@ -12463,7 +12483,7 @@ linux_docker() {
 		  20)
 			  clear
 			  send_stats "Docker卸载"
-			  read -e -p "$(echo -e "${gl_hong}注意: ${gl_bai}确定卸载docker环境吗？(Y/N): ")" choice
+			  read -e -p "$(echo -e "${gl_hong}注意: ${gl_bai}确定卸载docker环境吗？(Y/N): ")" choice || return 1
 			  case "$choice" in
 				[Yy])
 				  docker ps -a -q | xargs -r docker rm -f && docker images -q | xargs -r docker rmi && docker network prune -f && docker volume prune -f
@@ -13262,26 +13282,26 @@ EOF
 		echo "=== 交互式添加 OpenClaw Provider (全量模型) ==="
 
 		# 1. Provider 名称
-		read -erp "请输入 Provider 名称 (如: deepseek): " provider_name
+		read -erp "请输入 Provider 名称 (如: deepseek): " provider_name || return 1
 		while [[ -z "$provider_name" ]]; do
 			echo "❌ Provider 名称不能为空"
-			read -erp "请输入 Provider 名称: " provider_name
+			read -erp "请输入 Provider 名称: " provider_name || return 1
 		done
 
 		# 2. Base URL
-		read -erp "请输入 Base URL (如: https://api.xxx.com/v1): " base_url
+		read -erp "请输入 Base URL (如: https://api.xxx.com/v1): " base_url || return 1
 		while [[ -z "$base_url" ]]; do
 			echo "❌ Base URL 不能为空"
-			read -erp "请输入 Base URL: " base_url
+			read -erp "请输入 Base URL: " base_url || return 1
 		done
 		base_url="${base_url%/}"
 
 		# 3. API Key
-		read -rsp "请输入 API Key (输入不显示): " api_key
+		read -rsp "请输入 API Key (输入不显示): " api_key || return 1
 		echo
 		while [[ -z "$api_key" ]]; do
 			echo "❌ API Key 不能为空"
-			read -rsp "请输入 API Key: " api_key
+			read -rsp "请输入 API Key: " api_key || return 1
 			echo
 		done
 
@@ -13314,7 +13334,7 @@ EOF
 
 		# 5. 选择默认模型
 		echo
-		read -erp "请输入默认 Model ID (或序号，留空则使用第一个): " input_model
+		read -erp "请输入默认 Model ID (或序号，留空则使用第一个): " input_model || return 1
 
 		if [[ -z "$input_model" && -n "$available_models" ]]; then
 			default_model=$(echo "$available_models" | head -1)
@@ -13336,7 +13356,7 @@ EOF
 		echo "模型总数    : $model_count"
 		echo "======================"
 
-		read -erp "是否同时添加其他所有可用模型？(y/N): " confirm
+		read -erp "是否同时添加其他所有可用模型？(y/N): " confirm || return 1
 
 		install jq
 		if [[ "$confirm" =~ ^[Yy]$ ]]; then
@@ -13491,7 +13511,7 @@ sync-openclaw-provider-interactive() {
 		return 1
 	fi
 
-	read -erp "请输入要同步的 API 名称(provider)，直接回车同步全部: " provider_name
+	read -erp "请输入要同步的 API 名称(provider)，直接回车同步全部: " provider_name || return 1
 	if [ -z "$provider_name" ]; then
 		if sync_openclaw_api_models; then
 			start_gateway
@@ -13744,7 +13764,7 @@ fix-openclaw-provider-protocol-interactive() {
 		return 1
 	fi
 
-	read -erp "请输入要切换协议的 API 名称(provider): " provider_name
+	read -erp "请输入要切换协议的 API 名称(provider): " provider_name || return 1
 	if [ -z "$provider_name" ]; then
 		echo "❌ provider 名称不能为空"
 		break_end
@@ -13754,7 +13774,7 @@ fix-openclaw-provider-protocol-interactive() {
 	echo "请选择要设置的 API 类型："
 	echo "1. openai-completions"
 	echo "2. openai-responses"
-	read -erp "请输入你的选择 (1/2): " proto_choice
+	read -erp "请输入你的选择 (1/2): " proto_choice || return 1
 
 	local new_api=""
 	case "$proto_choice" in
@@ -13830,7 +13850,7 @@ PY
 			return 1
 		fi
 
-		read -erp "请输入要删除的 API 名称(provider): " provider_name
+		read -erp "请输入要删除的 API 名称(provider): " provider_name || return 1
 		if [ -z "$provider_name" ]; then
 			send_stats "OpenClaw API删除取消"
 			echo "❌ provider 名称不能为空"
@@ -14026,7 +14046,7 @@ PY
 		echo ""
 		echo -e "${gl_huang}提示：复制链接到浏览器打开即可访问${gl_bai}"
 		echo ""
-		read -erp "按回车键返回..." dummy
+		read -erp "按回车键返回..." dummy || return 1
 	}
 
 	openclaw_api_manage_menu() {
@@ -14045,7 +14065,7 @@ PY
 			echo "5. API 厂商推荐"
 			echo "0. 退出"
 			echo "---------------------------------------"
-			read -erp "请输入你的选择: " api_choice
+			read -erp "请输入你的选择: " api_choice || return 1
 
 			case "$api_choice" in
 				1)
@@ -14352,7 +14372,7 @@ PYTHON_EOF
 				echo "当前可用模型:"
 				jq -r '.agents.defaults.models | if type == "object" then keys[] else .[] end' "$oc_config" 2>/dev/null | sed '/^\s*$/d'
 				echo "----------------"
-				read -e -p "请输入要设置的模型名称 (例如 openrouter/openai/gpt-4o)（输入 0 退出）： " selected_model
+				read -e -p "请输入要设置的模型名称 (例如 openrouter/openai/gpt-4o)（输入 0 退出）： " selected_model || return 1
 
 				if [ "$selected_model" = "0" ]; then
 					echo "操作已取消，正在退出..."
@@ -14700,12 +14720,12 @@ PYTHON_EOF
 			echo "1) 安装/启用插件"
 			echo "2) 删除/禁用插件"
 			echo "0) 返回"
-			read -e -p "请选择操作：" plugin_action
+			read -e -p "请选择操作：" plugin_action || return 1
 
 			[ "$plugin_action" = "0" ] && break
 			[ -z "$plugin_action" ] && continue
 
-			read -e -p "请输入插件 ID（空格分隔，输入 0 退出）： " raw_input
+			read -e -p "请输入插件 ID（空格分隔，输入 0 退出）： " raw_input || return 1
 			[ "$raw_input" = "0" ] && break
 			[ -z "$raw_input" ] && continue
 
@@ -14828,12 +14848,12 @@ PYTHON_EOF
 			echo "1) 安装技能"
 			echo "2) 删除技能"
 			echo "0) 返回"
-			read -e -p "请选择操作：" skill_action
+			read -e -p "请选择操作：" skill_action || return 1
 
 			[ "$skill_action" = "0" ] && break
 			[ -z "$skill_action" ] && continue
 
-			read -e -p "请输入技能名称（空格分隔，输入 0 退出）： " skill_input
+			read -e -p "请输入技能名称（空格分隔，输入 0 退出）： " skill_input || return 1
 			[ "$skill_input" = "0" ] && break
 			[ -z "$skill_input" ] && continue
 
@@ -14844,7 +14864,7 @@ PYTHON_EOF
 			local token
 
 			if [ "$skill_action" = "2" ]; then
-				read -e -p "二次确认：删除仅影响用户目录 ~/.openclaw/workspace/skills，确认继续？(y/N): " confirm_del
+				read -e -p "二次确认：删除仅影响用户目录 ~/.openclaw/workspace/skills，确认继续？(y/N): " confirm_del || return 1
 				if [[ ! "$confirm_del" =~ ^[Yy]$ ]]; then
 					echo "已取消删除。"
 					break_end
@@ -14868,7 +14888,7 @@ PYTHON_EOF
 					fi
 
 					if [ "$skill_found" = true ]; then
-						read -e -p "技能 [$skill_name] 已安装，是否重新安装？(y/N): " reinstall
+						read -e -p "技能 [$skill_name] 已安装，是否重新安装？(y/N): " reinstall || return 1
 						if [[ ! "$reinstall" =~ ^[Yy]$ ]]; then
 							skipped_list="$skipped_list $skill_name"
 							continue
@@ -15154,11 +15174,11 @@ openclaw_json_get_bool() {
 			echo "----------------------------------------"
 			echo "0. 返回上一级选单"
 			echo "----------------------------------------"
-			read -e -p "请输入你的选择: " bot_choice
+			read -e -p "请输入你的选择: " bot_choice || return 1
 
 			case $bot_choice in
 				1)
-					read -e -p "请输入TG机器人收到的连接码 (例如 NYA99R2F)（输入 0 退出）： " code
+					read -e -p "请输入TG机器人收到的连接码 (例如 NYA99R2F)（输入 0 退出）： " code || return 1
 					if [ "$code" = "0" ]; then continue; fi
 					if [ -z "$code" ]; then echo "错误：连接码不能为空。"; sleep 1; continue; fi
 					openclaw pairing approve telegram "$code"
@@ -15171,7 +15191,7 @@ openclaw_json_get_bool() {
 					break_end
 					;;
 				3)
-					read -e -p "请输入WhatsApp收到的连接码 (例如 NYA99R2F)（输入 0 退出）： " code
+					read -e -p "请输入WhatsApp收到的连接码 (例如 NYA99R2F)（输入 0 退出）： " code || return 1
 					if [ "$code" = "0" ]; then continue; fi
 					if [ -z "$code" ]; then echo "错误：连接码不能为空。"; sleep 1; continue; fi
 					openclaw pairing approve whatsapp "$code"
@@ -15420,7 +15440,7 @@ if os.path.isdir(agents_root):
 		echo "备份模式："
 		echo "1. 安全模式（默认，推荐）：workspace + openclaw.json + extensions/skills/prompts/tools（如存在）"
 		echo "2. 完整模式（含更多状态，敏感风险更高）"
-		read -e -p "请选择备份模式（默认 1）: " export_mode
+		read -e -p "请选择备份模式（默认 1）: " export_mode || return 1
 		[ -z "$export_mode" ] && export_mode="1"
 
 		local mode_label="safe"
@@ -15477,7 +15497,7 @@ if os.path.isdir(agents_root):
 
 		echo "⚠️ 高风险操作：项目还原会覆盖 OpenClaw 配置与工作区内容。"
 		echo "⚠️ 还原前将执行 manifest/sha256 校验、白名单恢复、gateway 停启与健康检查。"
-		read -e -p "请输入确认词【我已知晓高风险并继续还原】后继续: " confirm_text
+		read -e -p "请输入确认词【我已知晓高风险并继续还原】后继续: " confirm_text || return 1
 		if [ "$confirm_text" != "我已知晓高风险并继续还原" ]; then
 			echo "❌ 确认词不匹配，已取消还原"
 			break_end
@@ -15645,7 +15665,7 @@ if os.path.isdir(agents_root):
 			return 0
 		fi
 
-		read -e -p "请输入要删除的文件名或完整路径（0 取消）: " user_input
+		read -e -p "请输入要删除的文件名或完整路径（0 取消）: " user_input || return 1
 		if [ "$user_input" = "0" ]; then
 			echo "已取消删除。"
 			break_end
@@ -15689,13 +15709,13 @@ if os.path.isdir(agents_root):
 		target_type=$(openclaw_backup_detect_type "$target_file")
 
 		echo "即将删除: [$target_type] $target_path"
-		read -e -p "第一次确认：输入 yes 确认继续: " confirm_step1
+		read -e -p "第一次确认：输入 yes 确认继续: " confirm_step1 || return 1
 		if [ "$confirm_step1" != "yes" ]; then
 			echo "已取消删除。"
 			break_end
 			return 0
 		fi
-		read -e -p "二次确认：输入 DELETE 执行删除: " confirm_step2
+		read -e -p "二次确认：输入 DELETE 执行删除: " confirm_step2 || return 1
 		if [ "$confirm_step2" != "DELETE" ]; then
 			echo "已取消删除。"
 			break_end
@@ -16270,7 +16290,7 @@ PY
 		fi
 		echo "确认后将自动安装/下载、写入配置、构建索引并重启网关"
 		echo "高级选项: 输入 config 仅写配置（不安装不下载、不索引、不重启）"
-		read -e -p "输入 yes 确认继续（默认 N）: " confirm_step
+		read -e -p "输入 yes 确认继续（默认 N）: " confirm_step || return 1
 		case "$confirm_step" in
 			yes|YES)
 				OPENCLAW_MEMORY_PREHEAT="true"
@@ -16465,7 +16485,7 @@ EOF
 			echo "3. Auto（自动选择）"
 			echo "0. 返回上一级"
 			echo "---------------------------------------"
-			read -e -p "请输入你的选择: " auto_choice
+			read -e -p "请输入你的选择: " auto_choice || return 1
 			case "$auto_choice" in
 				1)
 					openclaw_memory_auto_setup_run "qmd"
@@ -16520,7 +16540,7 @@ EOF
 
 	openclaw_memory_offer_restart() {
 		echo "配置已写入，需要重启 OpenClaw 网关后生效。"
-		read -e -p "是否立即重启 OpenClaw 网关？(Y/n): " restart_choice
+		read -e -p "是否立即重启 OpenClaw 网关？(Y/n): " restart_choice || return 1
 		if [[ "$restart_choice" =~ ^[Nn]$ ]]; then
 			echo "已跳过重启，可稍后执行: openclaw gateway restart"
 			return 0
@@ -16550,7 +16570,7 @@ EOF
 			echo "   这会导致默认记忆文件（MEMORY.md + memory/*.md）不被索引"
 			echo "   所以 Indexed 会一直显示 0/N"
 			echo ""
-			read -e -p "是否恢复为 true 并重建索引？(Y/n): " fix_choice
+			read -e -p "是否恢复为 true 并重建索引？(Y/n): " fix_choice || return 1
 			if [[ ! "$fix_choice" =~ ^[Nn]$ ]]; then
 				openclaw_memory_config_set "memory.qmd.includeDefaultMemory" true
 				if [ $? -ne 0 ]; then
@@ -16567,7 +16587,7 @@ EOF
 			echo "includeDefaultMemory 配置正常。"
 			echo "将执行：清理旧索引 → 全量重建所有智能体索引"
 			echo ""
-			read -e -p "确认执行？(Y/n): " confirm_fix
+			read -e -p "确认执行？(Y/n): " confirm_fix || return 1
 			if [[ ! "$confirm_fix" =~ ^[Nn]$ ]]; then
 				openclaw_memory_rebuild_index_all
 			else
@@ -16601,7 +16621,7 @@ EOF
 			echo "3. Auto（自动推荐并自动部署）"
 			echo "0. 返回上一级"
 			echo "---------------------------------------"
-			read -e -p "请输入你的选择: " scheme_choice
+			read -e -p "请输入你的选择: " scheme_choice || return 1
 			case "$scheme_choice" in
 				1)
 					openclaw_memory_auto_setup_run "qmd"
@@ -16682,8 +16702,8 @@ EOF
 		local start_line count
 		echo "文件: $file"
 		echo "总行数: $total_lines"
-		read -e -p "请输入起始行（回车默认末尾 $default_lines 行）: " start_line
-		read -e -p "请输入显示行数（回车默认 $default_lines）: " count
+		read -e -p "请输入起始行（回车默认末尾 $default_lines 行）: " start_line || return 1
+		read -e -p "请输入显示行数（回车默认 $default_lines）: " count || return 1
 		[ -z "$count" ] && count=$default_lines
 		if [ -z "$start_line" ]; then
 			if [ "$total_lines" -le "$count" ]; then
@@ -16724,7 +16744,7 @@ EOF
 			echo "======================================="
 			openclaw_memory_file_render_list
 			echo "---------------------------------------"
-			read -e -p "请输入文件编号查看（0 返回）: " file_choice
+			read -e -p "请输入文件编号查看（0 返回）: " file_choice || return 1
 			if [ "$file_choice" = "0" ]; then
 				return 0
 			fi
@@ -16751,7 +16771,7 @@ EOF
 
 
 	openclaw_memory_search_test() {
-		read -e -p "输入搜索关键词: " query
+		read -e -p "输入搜索关键词: " query || return 1
 		if [ -z "$query" ]; then
 			echo "关键词不能为空。"
 			return 1
@@ -16781,22 +16801,22 @@ EOF
 			echo "6. 深度状态探测（检查嵌入模型）"
 			echo "0. 返回上一级"
 			echo "---------------------------------------"
-			read -e -p "请输入你的选择: " memory_choice
+			read -e -p "请输入你的选择: " memory_choice || return 1
 			case "$memory_choice" in
 				1)
 					echo "即将更新记忆索引。"
-					read -e -p "第一次确认：输入 yes 继续: " confirm_step1
+					read -e -p "第一次确认：输入 yes 继续: " confirm_step1 || return 1
 					if [ "$confirm_step1" != "yes" ]; then
 						echo "已取消。"
 						break_end
 						continue
 					fi
 				openclaw_memory_prepare_workspace_all
-				read -e -p "二次确认：输入 force 使用全量（留空为增量）: " confirm_step2
+				read -e -p "二次确认：输入 force 使用全量（留空为增量）: " confirm_step2 || return 1
 				if [ "$confirm_step2" = "force" ]; then
 					echo "⚠️ 全量重建更彻底，但耗时更长。"
 					echo "推荐：输入 rebuild 进行安全重建（先备份索引库）。"
-					read -e -p "第三次确认：输入 rebuild 执行安全重建；直接回车继续普通 force: " confirm_step3
+					read -e -p "第三次确认：输入 rebuild 执行安全重建；直接回车继续普通 force: " confirm_step3 || return 1
 					if [ "$confirm_step3" = "rebuild" ]; then
 						openclaw_memory_rebuild_index_all
 					else
@@ -17229,7 +17249,7 @@ except Exception:
 		echo "======================================="
 		openclaw security audit
 		echo "---------------------------------------"
-		read -e -p "是否尝试自动修复发现的安全隐患？(y/n): " fix_choice
+		read -e -p "是否尝试自动修复发现的安全隐患？(y/n): " fix_choice || return 1
 		if [[ "$fix_choice" == "y" || "$fix_choice" == "Y" || "$fix_choice" == "yes" ]]; then
 			openclaw security audit --fix
 			echo -e "${gl_lv}✅ 自动修复完成。${gl_bai}"
@@ -17276,18 +17296,18 @@ except Exception as e:
 			echo "2. 移除白名单规则"
 			echo "0. 返回"
 			echo "---------------------------------------"
-			read -e -p "请选择: " al_choice
+			read -e -p "请选择: " al_choice || return 1
 			case "$al_choice" in
 				1)
-					read -e -p "输入要放行的命令路径 (支持 glob，如 /usr/bin/git): " pattern
+					read -e -p "输入要放行的命令路径 (支持 glob，如 /usr/bin/git): " pattern || return 1
 					[ -z "$pattern" ] && { echo "不能为空"; break_end; continue; }
-					read -e -p "指定智能体ID (留空=所有智能体 *): " agent_id
+					read -e -p "指定智能体ID (留空=所有智能体 *): " agent_id || return 1
 					agent_id="${agent_id:-*}"
 					openclaw approvals allowlist add --agent "$agent_id" "$pattern"
 					break_end
 					;;
 				2)
-					read -e -p "输入要移除的命令路径: " pattern
+					read -e -p "输入要移除的命令路径: " pattern || return 1
 					[ -z "$pattern" ] && { echo "不能为空"; break_end; continue; }
 					openclaw approvals allowlist remove "$pattern"
 					break_end
@@ -17315,29 +17335,29 @@ except Exception as e:
 			echo -e "${gl_kjlan}6.${gl_bai} 管理 Exec 命令白名单"
 			echo -e "${gl_kjlan}0.${gl_bai} 返回上一级"
 			echo "---------------------------------------"
-			read -e -p "请输入你的选择: " perm_choice
+			read -e -p "请输入你的选择: " perm_choice || return 1
 			case "$perm_choice" in
 				1)
 					echo "准备应用：标准安全模式"
-					read -e -p "输入 yes 确认: " confirm
+					read -e -p "输入 yes 确认: " confirm || return 1
 					if [ "$confirm" = "yes" ]; then openclaw_permission_apply_standard; else echo "已取消"; fi
 					break_end
 					;;
 				2)
 					echo "准备应用：开发增强模式"
-					read -e -p "输入 yes 确认: " confirm
+					read -e -p "输入 yes 确认: " confirm || return 1
 					if [ "$confirm" = "yes" ]; then openclaw_permission_apply_developer; else echo "已取消"; fi
 					break_end
 					;;
 				3)
 					echo -e "${gl_hong}⚠️ 完全开放模式会彻底瓦解 exec 审批并自动放行高危代码。${gl_bai}"
-					read -e -p "输入 FULL 确认继续: " confirm
+					read -e -p "输入 FULL 确认继续: " confirm || return 1
 					if [ "$confirm" = "FULL" ]; then openclaw_permission_apply_full; else echo "已取消"; fi
 					break_end
 					;;
 				4)
 					echo "将清除所有定制覆盖，恢复 OpenClaw 刚安装时的严格沙盒状态。"
-					read -e -p "输入 yes 确认: " confirm
+					read -e -p "输入 yes 确认: " confirm || return 1
 					if [ "$confirm" = "yes" ]; then openclaw_permission_restore_official_defaults; else echo "已取消"; fi
 					break_end
 					;;
@@ -17579,20 +17599,20 @@ for idx,item in enumerate(agents,1):
 		send_stats "OpenClaw多智能体-新增Agent"
 		openclaw_multiagent_require_openclaw || return 1
 		local agent_id workspace confirm
-		read -e -p "请输入新的 Agent ID: " agent_id
+		read -e -p "请输入新的 Agent ID: " agent_id || return 1
 		[ -z "$agent_id" ] && echo "已取消：Agent ID 不能为空。" && return 1
-		read -e -p "请输入 workspace 路径（默认 ~/.openclaw/workspace-${agent_id}）: " workspace
+		read -e -p "请输入 workspace 路径（默认 ~/.openclaw/workspace-${agent_id}）: " workspace || return 1
 		[ -z "$workspace" ] && workspace="~/.openclaw/workspace-${agent_id}"
 		echo "将创建智能体: $agent_id"
 		echo "工作目录: $workspace"
-		read -e -p "输入 yes 确认继续: " confirm
+		read -e -p "输入 yes 确认继续: " confirm || return 1
 		[ "$confirm" = "yes" ] || { echo "已取消"; return 1; }
 		if openclaw agents add "$agent_id" --workspace "$workspace"; then
 			echo "✅ 智能体创建成功: $agent_id"
 			local name theme
-			read -e -p "请输入智能体身份名称 (如: 代码专家): " name
+			read -e -p "请输入智能体身份名称 (如: 代码专家): " name || return 1
 			[ -z "$name" ] && name="$agent_id"
-			read -e -p "请输入智能体性格主题 (如: 严谨、高效): " theme
+			read -e -p "请输入智能体性格主题 (如: 严谨、高效): " theme || return 1
 			[ -z "$theme" ] && theme="助手"
 			echo "正在配置智能体身份..."
 			openclaw agents set-identity --agent "$agent_id" --name "$name" --theme "$theme"
@@ -17606,10 +17626,10 @@ for idx,item in enumerate(agents,1):
 		send_stats "OpenClaw多智能体-删除Agent"
 		openclaw_multiagent_require_openclaw || return 1
 		local agent_id confirm
-		read -e -p "请输入要删除的 Agent ID: " agent_id
+		read -e -p "请输入要删除的 Agent ID: " agent_id || return 1
 		[ -z "$agent_id" ] && echo "已取消：Agent ID 不能为空。" && return 1
 		echo "⚠️ 删除智能体可能影响其工作目录、路由绑定与会话路由。"
-		read -e -p "输入 DELETE 确认删除 ${agent_id}: " confirm
+		read -e -p "输入 DELETE 确认删除 ${agent_id}: " confirm || return 1
 		[ "$confirm" = "DELETE" ] || { echo "已取消"; return 1; }
 		if openclaw agents delete "$agent_id"; then
 			echo "✅ 智能体删除成功: $agent_id"
@@ -17637,11 +17657,11 @@ for idx,item in enumerate(bindings,1):
 		send_stats "OpenClaw多智能体-新增路由绑定"
 		openclaw_multiagent_require_openclaw || return 1
 		local agent_id bind_value confirm
-		read -e -p "请输入智能体 ID: " agent_id
-		read -e -p "请输入路由绑定值（如 telegram:ops / discord:guild-a）: " bind_value
+		read -e -p "请输入智能体 ID: " agent_id || return 1
+		read -e -p "请输入路由绑定值（如 telegram:ops / discord:guild-a）: " bind_value || return 1
 		{ [ -z "$agent_id" ] || [ -z "$bind_value" ]; } && echo "已取消：参数不能为空。" && return 1
 		echo "将绑定智能体 [$agent_id] -> [$bind_value]"
-		read -e -p "输入 yes 确认继续: " confirm
+		read -e -p "输入 yes 确认继续: " confirm || return 1
 		[ "$confirm" = "yes" ] || { echo "已取消"; return 1; }
 		if openclaw agents bind --agent "$agent_id" --bind "$bind_value"; then
 			echo "✅ 路由绑定添加成功"
@@ -17655,11 +17675,11 @@ for idx,item in enumerate(bindings,1):
 		send_stats "OpenClaw多智能体-移除路由绑定"
 		openclaw_multiagent_require_openclaw || return 1
 		local agent_id bind_value confirm
-		read -e -p "请输入智能体 ID: " agent_id
-		read -e -p "请输入要移除的路由绑定值: " bind_value
+		read -e -p "请输入智能体 ID: " agent_id || return 1
+		read -e -p "请输入要移除的路由绑定值: " bind_value || return 1
 		{ [ -z "$agent_id" ] || [ -z "$bind_value" ]; } && echo "已取消：参数不能为空。" && return 1
 		echo "将移除智能体 [$agent_id] 的路由绑定 [$bind_value]"
-		read -e -p "输入 yes 确认继续: " confirm
+		read -e -p "输入 yes 确认继续: " confirm || return 1
 		[ "$confirm" = "yes" ] || { echo "已取消"; return 1; }
 		if openclaw agents unbind --agent "$agent_id" --bind "$bind_value"; then
 			echo "✅ 路由绑定移除成功"
@@ -17739,16 +17759,16 @@ print("✅ 多智能体健康检查完成")
 	openclaw_multiagent_set_identity() {
 		openclaw_multiagent_require_openclaw || return 1
 		openclaw_multiagent_list_agents
-		read -e -p "输入要修改身份的智能体ID: " agent_id
+		read -e -p "输入要修改身份的智能体ID: " agent_id || return 1
 		[ -z "$agent_id" ] && { echo "ID 不能为空"; return 1; }
 		echo "修改选项（留空跳过）："
-		read -e -p "  新名称: " new_name
-		read -e -p "  新 Emoji: " new_emoji
+		read -e -p "  新名称: " new_name || return 1
+		read -e -p "  新 Emoji: " new_emoji || return 1
 		local cmd="openclaw agents set-identity --agent $agent_id"
 		[ -n "$new_name" ] && cmd="$cmd --name $new_name"
 		[ -n "$new_emoji" ] && cmd="$cmd --emoji $new_emoji"
 		echo "也可以从 IDENTITY.md 自动读取身份信息。"
-		read -e -p "是否从 IDENTITY.md 读取？(y/n): " from_id
+		read -e -p "是否从 IDENTITY.md 读取？(y/n): " from_id || return 1
 		if [ "$from_id" = "y" ]; then
 			cmd="openclaw agents set-identity --agent $agent_id --from-identity"
 		fi
@@ -17758,7 +17778,7 @@ print("✅ 多智能体健康检查完成")
 	openclaw_multiagent_cleanup_sessions() {
 		openclaw_multiagent_require_openclaw || return 1
 		echo "即将清理过期/冗余会话数据..."
-		read -e -p "输入 yes 确认: " confirm
+		read -e -p "输入 yes 确认: " confirm || return 1
 		[ "$confirm" != "yes" ] && { echo "已取消"; return 0; }
 		openclaw sessions cleanup
 	}
@@ -17783,7 +17803,7 @@ print("✅ 多智能体健康检查完成")
 			echo "9. 清理过期会话"
 			echo "0. 返回上一级"
 			echo "---------------------------------------"
-			read -e -p "请输入你的选择: " multi_choice
+			read -e -p "请输入你的选择: " multi_choice || return 1
 			case "$multi_choice" in
 				1) openclaw_multiagent_add_agent; break_end ;;
 				2) openclaw_multiagent_delete_agent; break_end ;;
@@ -17818,7 +17838,7 @@ openclaw_backup_restore_menu() {
 			echo "5. 删除备份文件"
 			echo "0. 返回上一级"
 			echo "---------------------------------------"
-			read -e -p "请输入你的选择: " backup_choice
+			read -e -p "请输入你的选择: " backup_choice || return 1
 
 			case "$backup_choice" in
 				1) openclaw_memory_backup_export ;;
@@ -17959,7 +17979,7 @@ openclaw_backup_restore_menu() {
 
 		openclaw devices list
 
-		read -e -p "请输入 Request_Key: " Request_Key
+		read -e -p "请输入 Request_Key: " Request_Key || return 1
 
 		[ -z "$Request_Key" ] && {
 			echo "Request_Key 不能为空"
@@ -17988,7 +18008,7 @@ openclaw_backup_restore_menu() {
 			echo "2. 删除域名访问"
 			echo "0. 退出"
 			echo
-			read -e -p "请选择: " choice
+			read -e -p "请选择: " choice || return 1
 
 			case "$choice" in
 				1)
@@ -18016,7 +18036,7 @@ openclaw_backup_restore_menu() {
 	# 主循环
 	while true; do
 		show_menu
-		read choice
+		read choice || return 1
 		case $choice in
 			1) install_moltbot ;;
 			2) start_bot ;;
@@ -18171,10 +18191,10 @@ ssh_config_manager() {
 			echo -e "${gl_kjlan}3.   ${gl_bai}添加私钥"
 			echo -e "${gl_kjlan}4.   ${gl_bai}删除私钥"
 			echo -e "${gl_kjlan}0.   ${gl_bai}返回上一级菜单"
-			read -e -p "请输入你的选择: " sub_choice
+			read -e -p "请输入你的选择: " sub_choice || return 1
 			case "$sub_choice" in
-				1) read -e -p "请粘贴公钥: " public_key; ssh_add_public_key "$public_key" ;;
-				2) read -e -p "请输入要删除的公钥行号: " line_no; [[ "$line_no" =~ ^[0-9]+$ ]] && sed -i "${line_no}d" /root/.ssh/authorized_keys ;;
+				1) read -e -p "请粘贴公钥: " public_key || return 1; ssh_add_public_key "$public_key" ;;
+				2) read -e -p "请输入要删除的公钥行号: " line_no || return 1; [[ "$line_no" =~ ^[0-9]+$ ]] && sed -i "${line_no}d" /root/.ssh/authorized_keys ;;
 				3)
 					read -e -p "请输入私钥文件名（默认 id_ed25519）: " key_name || return 0
 					key_name=${key_name:-id_ed25519}
@@ -18216,10 +18236,10 @@ ssh_config_manager() {
 		echo -e "${gl_kjlan}5.   ${gl_bai}公钥和私钥管理"
 		echo -e "${gl_kjlan}6.   ${gl_bai}修改 sshd_config 配置文件"
 		echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
-		read -e -p "请输入你的选择: " sub_choice
+		read -e -p "请输入你的选择: " sub_choice || return 1
 		case "$sub_choice" in
 			1)
-				read -e -p "请输入新 SSH 端口（默认 $DEFAULT_SSH_PORT）: " new_port
+				read -e -p "请输入新 SSH 端口（默认 $DEFAULT_SSH_PORT）: " new_port || return 1
 				new_port=${new_port:-$DEFAULT_SSH_PORT}
 				if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1 ] && [ "$new_port" -le 65535 ]; then
 					ssh_config_backup
@@ -18237,7 +18257,7 @@ ssh_config_manager() {
 				;;
 			2)
 				echo "1. 禁用密码登录    2. 开启密码登录"
-				read -e -p "请选择: " mode
+				read -e -p "请选择: " mode || return 1
 				ssh_config_backup
 				if [ "$mode" = "1" ]; then
 					ssh_set_option PasswordAuthentication no
@@ -18253,10 +18273,10 @@ ssh_config_manager() {
 				;;
 			3)
 				echo "1. 开启密钥登录    2. 禁用密钥登录"
-				read -e -p "请选择: " mode
+				read -e -p "请选择: " mode || return 1
 				ssh_config_backup
 				if [ "$mode" = "1" ]; then
-					read -e -p "请粘贴公钥（可直接回车跳过）: " public_key
+					read -e -p "请粘贴公钥（可直接回车跳过）: " public_key || return 1
 					ssh_add_public_key "$public_key"
 					ssh_set_option PubkeyAuthentication yes
 					ssh_set_option AuthorizedKeysFile ".ssh/authorized_keys"
@@ -18266,9 +18286,9 @@ ssh_config_manager() {
 				ssh_restart_safe
 				;;
 			4)
-				read -e -p "请粘贴公钥: " public_key
+				read -e -p "请粘贴公钥: " public_key || return 1
 				ssh_add_public_key "$public_key" || { break_end; continue; }
-				read -e -p "请输入 SSH 端口（默认 $DEFAULT_SSH_PORT）: " new_port
+				read -e -p "请输入 SSH 端口（默认 $DEFAULT_SSH_PORT）: " new_port || return 1
 				new_port=${new_port:-$DEFAULT_SSH_PORT}
 				if ! validate_tcp_port "$new_port"; then echo "端口不合法"; break_end; continue; fi
 				ssh_config_backup
@@ -18317,7 +18337,7 @@ ufw_manager() {
 		echo -e "${gl_kjlan}3.   ${gl_bai}开放端口（例如 80 或 80/tcp，对应 ufw allow）"
 		echo -e "${gl_kjlan}4.   ${gl_bai}删除端口规则（例如 80 或 80/tcp，对应 ufw delete allow）"
 		echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
-		read -e -p "请输入你的选择: " sub_choice
+		read -e -p "请输入你的选择: " sub_choice || return 1
 		case "$sub_choice" in
 			1)
 				root_use
@@ -18326,8 +18346,8 @@ ufw_manager() {
 				fi
 				;;
 			2) root_use; ufw disable 2>/dev/null || true; remove ufw; rm -rf /etc/ufw /var/lib/ufw ;;
-			3) root_use; read -e -p "请输入要开放的端口/协议: " port_rule; [ -n "$port_rule" ] && ufw allow "$port_rule"; ufw status numbered ;;
-			4) root_use; read -e -p "请输入要删除的端口/协议: " port_rule; [ -n "$port_rule" ] && ufw delete allow "$port_rule"; ufw status numbered ;;
+			3) root_use; read -e -p "请输入要开放的端口/协议: " port_rule || return 1; [ -n "$port_rule" ] && ufw allow "$port_rule"; ufw status numbered ;;
+			4) root_use; read -e -p "请输入要删除的端口/协议: " port_rule || return 1; [ -n "$port_rule" ] && ufw delete allow "$port_rule"; ufw status numbered ;;
 			0) return ;;
 			*) echo "无效的输入!" ;;
 		esac
@@ -18515,7 +18535,7 @@ fail2ban_manager() {
 		echo -e "${gl_kjlan}2.   ${gl_bai}卸载 Fail2ban（停止服务并删除配置/状态目录）"
 		echo -e "${gl_kjlan}3.   ${gl_bai}检查 sshd 配置（端口不对自动修正）"
 		echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
-		read -e -p "请输入你的选择: " sub_choice
+		read -e -p "请输入你的选择: " sub_choice || return 1
 		case "$sub_choice" in
 			1) fail2ban_install_sshd ;;
 			2) fail2ban_uninstall_all ;;
@@ -19777,7 +19797,7 @@ common_one_click_scripts() {
 		echo -e "${gl_kjlan}11.  ${gl_bai}sing-box安装"
 		echo -e "${gl_kjlan}12.  ${gl_bai}TcpQuality"
 		echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
-		read -e -p "请输入你的选择: " sub_choice
+		read -e -p "请输入你的选择: " sub_choice || return 1
 		case "$sub_choice" in
 			1) daimon_exec_cached_script "https://run.NodeQuality.com" "NodeQuality.sh" ;;
 			2) daimon_exec_cached_script "https://IP.Check.Place" "IPQuality.sh" ;;
@@ -19895,7 +19915,7 @@ rclone_edit_config() {
 
 rclone_uninstall_tool() {
 	root_use
-	read -e -p "确认卸载 rclone？(y/N): " confirm
+	read -e -p "确认卸载 rclone？(y/N): " confirm || return 1
 	[ "$confirm" = "y" ] || [ "$confirm" = "Y" ] || { echo "已取消"; return; }
 	if command -v apt >/dev/null 2>&1; then
 		apt purge -y rclone 2>/dev/null || true
@@ -19907,7 +19927,7 @@ rclone_uninstall_tool() {
 		apk del rclone 2>/dev/null || true
 	fi
 	rm -f /usr/bin/rclone /usr/local/bin/rclone 2>/dev/null || true
-	read -e -p "是否同时删除 /root/.config/rclone 配置目录？(y/N): " remove_conf
+	read -e -p "是否同时删除 /root/.config/rclone 配置目录？(y/N): " remove_conf || return 1
 	if [ "$remove_conf" = "y" ] || [ "$remove_conf" = "Y" ]; then
 		rm -rf /root/.config/rclone
 	fi
@@ -19957,7 +19977,7 @@ rclone_select_remote_dir() {
 		printf "%2d. %s\n" "$((i+1))" "${valid_dirs[i]}"
 	done
 	echo "------------------------"
-	read -e -p "请输入目录序号: " selected_idx
+	read -e -p "请输入目录序号: " selected_idx || return 1
 	if ! [[ "$selected_idx" =~ ^[0-9]+$ ]] || [ "$selected_idx" -lt 1 ] || [ "$selected_idx" -gt "${#valid_dirs[@]}" ]; then
 		echo "无效编号"
 		return 1
@@ -19998,7 +20018,7 @@ rclone_select_remote_dirs_multi() {
 	done
 	echo "------------------------"
 	echo "支持输入: 1 2 3、1,2,3、all"
-	read -e -p "请输入目录序号（0 返回）: " selected_raw
+	read -e -p "请输入目录序号（0 返回）: " selected_raw || return 1
 	[ "$selected_raw" = "0" ] && return 1
 	selected_raw="${selected_raw//,/ }"
 
@@ -20050,7 +20070,7 @@ rclone_restore_remote_folder() {
 		target_dir="/root/${restore_dir}"
 		echo "rclone copy \"$remote_path\" \"$target_dir\" --progress"
 	done
-	read -e -p "确认恢复以上 ${#restore_dirs[@]} 个文件夹？(y/N): " confirm
+	read -e -p "确认恢复以上 ${#restore_dirs[@]} 个文件夹？(y/N): " confirm || return 1
 	[ "$confirm" = "y" ] || [ "$confirm" = "Y" ] || { echo "已取消"; return; }
 
 	failed=0
@@ -20205,7 +20225,7 @@ rclone_restore_nginx_domain_remote() {
 		echo -e "${gl_kjlan}4.   ${gl_bai}一键恢复全部"
 		echo -e "${gl_kjlan}0.   ${gl_bai}返回"
 		echo -e "${gl_kjlan}------------------------${gl_bai}"
-		read -e -p "请输入你的选择: " choice
+		read -e -p "请输入你的选择: " choice || return 1
 		case "$choice" in
 			1)
 				rclone_restore_remote_sites_available "$remote_backup" && rclone_check_nginx_after_restore
@@ -20217,7 +20237,7 @@ rclone_restore_nginx_domain_remote() {
 				rclone_restore_remote_domain "$remote_backup" && rclone_check_nginx_after_restore
 				;;
 			4)
-				read -e -p "确认一键恢复 sites-available、sites-enabled 软链接和 /root/domain？同名文件保留本机现有版本。(y/N): " confirm
+				read -e -p "确认一键恢复 sites-available、sites-enabled 软链接和 /root/domain？同名文件保留本机现有版本。(y/N): " confirm || return 1
 				[ "$confirm" = "y" ] || [ "$confirm" = "Y" ] || { echo "已取消"; continue; }
 				failed=0
 				rclone_restore_remote_sites_available "$remote_backup" || failed=1
@@ -20317,7 +20337,7 @@ rclone_restore_docker_compose_projects() {
 		return 1
 	fi
 
-	read -e -p "确认启动以上 ${#start_dirs[@]} 个 Docker Compose 项目？(y/N): " confirm
+	read -e -p "确认启动以上 ${#start_dirs[@]} 个 Docker Compose 项目？(y/N): " confirm || return 1
 	[ "$confirm" = "y" ] || [ "$confirm" = "Y" ] || { echo "已取消"; return 0; }
 
 	for project_dir in "${start_dirs[@]}"; do
@@ -20354,7 +20374,7 @@ rclone_manager() {
 		echo -e "${gl_kjlan}6.   ${gl_bai}Docker Compose 恢复"
 		echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
 		echo -e "${gl_kjlan}------------------------${gl_bai}"
-		read -e -p "请输入你的选择: " sub_choice
+		read -e -p "请输入你的选择: " sub_choice || return 1
 		case $sub_choice in
 			1) rclone_install_tool ;;
 			2) rclone_edit_config ;;
@@ -20507,7 +20527,7 @@ bitwarden_restore_data() {
 		printf "%2d. %-28s %s bytes\n" "$((i+1))" "${files[i]}" "$size"
 	done
 	echo "------------------------"
-	read -e -i "1" -p "请选择要还原的备份编号（默认 1 最新）: " selected_idx
+	read -e -i "1" -p "请选择要还原的备份编号（默认 1 最新）: " selected_idx || return 1
 	selected_idx="${selected_idx:-1}"
 	if ! [[ "$selected_idx" =~ ^[0-9]+$ ]] || [ "$selected_idx" -lt 1 ] || [ "$selected_idx" -gt "${#files[@]}" ]; then
 		echo "无效编号"
@@ -20516,7 +20536,7 @@ bitwarden_restore_data() {
 
 	selected_file="${files[$((selected_idx-1))]}"
 	echo -e "${gl_huang}即将还原: $selected_file${gl_bai}"
-	read -e -p "还原会覆盖 vaultwarden-data 数据，确认继续？(y/N): " confirm
+	read -e -p "还原会覆盖 vaultwarden-data 数据，确认继续？(y/N): " confirm || return 1
 	[ "$confirm" = "y" ] || [ "$confirm" = "Y" ] || { echo "已取消"; return; }
 
 	restore_dir="$(pwd)"
@@ -20608,7 +20628,7 @@ bitwarden_manager() {
 		echo -e "${gl_kjlan}4.   ${gl_bai}配置 Bitwarden 同步脚本（OneDrive -> kissska1）"
 		echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
 		echo -e "${gl_kjlan}------------------------${gl_bai}"
-		read -e -p "请输入你的选择: " sub_choice
+		read -e -p "请输入你的选择: " sub_choice || return 1
 		case $sub_choice in
 			1) bitwarden_configure_rclone_conf ;;
 			2) bitwarden_backup_data ;;
@@ -21146,14 +21166,14 @@ crontab_sync_all_numbers() {
 crontab_sync_create_custom() {
 	root_use
 	local name file cron_expr cron_line
-	read -e -p "请输入自定义脚本名称（自动补全 .sh 后缀）: " name
+	read -e -p "请输入自定义脚本名称（自动补全 .sh 后缀）: " name || return 1
 	[ -z "$name" ] && { echo "名称不能为空"; return 1; }
 	name=$(basename "$name")
 	name=$(echo "$name" | sed 's/[[:space:]]/_/g; s/[^A-Za-z0-9_.-]/_/g')
 	[ -z "${name//_/}" ] && { echo "名称无效"; return 1; }
 	[[ "$name" == *.sh ]] || name="${name}.sh"
 	file=$(crontab_sync_script_file_by_id custom "$name")
-	read -e -i "45 4 * * *" -p "请输入定时规则（默认 45 4 * * *）: " cron_expr
+	read -e -i "45 4 * * *" -p "请输入定时规则（默认 45 4 * * *）: " cron_expr || return 1
 	cron_expr="${cron_expr:-45 4 * * *}"
 	cron_line="$cron_expr /bin/bash $file >> /var/log/rclone/cron_${name%.sh}.log 2>&1"
 
@@ -21188,27 +21208,27 @@ crontab_sync_manager() {
 		echo -e "${gl_kjlan}5.   ${gl_bai}自定义脚本"
 		echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
 		echo -e "${gl_kjlan}------------------------${gl_bai}"
-		read -e -p "请输入你的选择: " sub_choice
+		read -e -p "请输入你的选择: " sub_choice || return 1
 		case "$sub_choice" in
 			1)
-				read -e -p "请输入要安装的脚本编号（支持多选，空格分隔）: " nums
+				read -e -p "请输入要安装的脚本编号（支持多选，空格分隔）: " nums || return 1
 				crontab_sync_handle_numbers install "$nums"
 				;;
 			2)
-				read -e -p "请输入要卸载的脚本编号（支持多选，空格分隔）: " nums
+				read -e -p "请输入要卸载的脚本编号（支持多选，空格分隔）: " nums || return 1
 				crontab_sync_handle_numbers remove "$nums"
 				;;
 			3)
 				local nums
 				nums="$(crontab_sync_all_numbers)"
-				read -e -i "$nums" -p "请确认/修改要安装的脚本编号（默认全选，空格分隔）: " nums
+				read -e -i "$nums" -p "请确认/修改要安装的脚本编号（默认全选，空格分隔）: " nums || return 1
 				crontab_sync_handle_numbers install "$nums"
 				;;
 			4)
 				local nums
 				nums="$(crontab_sync_all_numbers)"
-				read -e -i "$nums" -p "请确认/修改要卸载的脚本编号（默认全选，空格分隔）: " nums
-				read -e -p "确认卸载以上编号对应脚本和定时任务？(y/N): " confirm
+				read -e -i "$nums" -p "请确认/修改要卸载的脚本编号（默认全选，空格分隔）: " nums || return 1
+				read -e -p "确认卸载以上编号对应脚本和定时任务？(y/N): " confirm || return 1
 				if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
 					crontab_sync_handle_numbers remove "$nums"
 				else
@@ -21244,7 +21264,7 @@ warp_manager() {
 		echo -e "${gl_kjlan}2.   ${gl_bai}彻底删除 WARP（删除 WARP 网络接口、Linux Client 和 WireProxy）"
 		echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
 		echo -e "${gl_kjlan}------------------------${gl_bai}"
-		read -e -p "请输入你的选择: " sub_choice
+		read -e -p "请输入你的选择: " sub_choice || return 1
 		case $sub_choice in
 			1)
 				clear
@@ -21255,7 +21275,7 @@ warp_manager() {
 			2)
 				clear
 				echo -e "${gl_hong}警告：此操作会永久关闭并彻底删除 WARP 网络接口、WARP Linux Client 和 WireProxy。${gl_bai}"
-				read -e -p "确认彻底删除 WARP？(y/N): " confirm
+				read -e -p "确认彻底删除 WARP？(y/N): " confirm || return 1
 				if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
 					send_stats "彻底删除warp"
 					install wget curl
@@ -21301,7 +21321,10 @@ kejilion_update() {
 	keep_canshu=$(grep -h '^canshu=' /usr/local/bin/d "$DAIMON_LOCAL_SCRIPT" "$DAIMON_OLD_LOCAL_SCRIPT" 2>/dev/null | tail -n 1 || true)
 	keep_stats=$(grep -h '^ENABLE_STATS=' /usr/local/bin/d "$DAIMON_LOCAL_SCRIPT" "$DAIMON_OLD_LOCAL_SCRIPT" 2>/dev/null | tail -n 1 || true)
 
-	read -e -p "更新 Nginx + 域名续期脚本？(1=仅主脚本，2=同时更新，0=取消): " cert_helper_choice
+	read -e -p "更新 Nginx + 域名续期脚本？(1=仅主脚本，2=同时更新，0=取消): " cert_helper_choice || {
+		rm -f "$tmp_file" "$rollback_file"
+		return 1
+	}
 	case "$cert_helper_choice" in
 		2) : > "$DAIMON_CERT_HELPER_MARKER" ;;
 		1|"") rm -f "$DAIMON_CERT_HELPER_MARKER" 2>/dev/null || true ;;
@@ -21321,7 +21344,7 @@ kejilion_update() {
 		break_end
 		return 1
 	fi
-	if ! cp -f "$DAIMON_LOCAL_SCRIPT" /usr/local/bin/d; then
+	if ! daimon_install_script_file "$DAIMON_LOCAL_SCRIPT" /usr/local/bin/d; then
 		echo -e "${gl_hong}更新失败：无法写入 /usr/local/bin/d${gl_bai}"
 		[ -n "$rollback_file" ] && [ -f "$rollback_file" ] && cp -f "$rollback_file" "$DAIMON_LOCAL_SCRIPT" 2>/dev/null || true
 		rm -f "$rollback_file" "$DAIMON_CERT_HELPER_MARKER" 2>/dev/null || true

@@ -118,6 +118,90 @@ test_package_lock() {
     ! fix_dpkg || return 1
     [ ! -s "$trace" ]
 }
+test_package_failure() {
+    load_function install || return 1
+    command() {
+        if [ "${1:-}" = -v ]; then [ "$2" = apt ]; else builtin command "$@"; fi
+    }
+    apt() { [ "${*: -1}" != first ]; }
+    ! install first second
+}
+test_submenu_eof() {
+    local name="$1" count=0 sub_choice='' choice=''
+    load_function "$name" || return 1
+    crontab_sync_reconcile_legacy() { :; }
+    add_swap() { return 77; }
+    read() { count=$((count + 1)); [ "$count" -lt 3 ] || exit 77; return 1; }
+    "$name" </dev/null
+    [ "$count" -eq 1 ]
+}
+test_update_syntax() {
+    load_function daimon_validate_update_file || return 1
+    local fixture="$WORK/broken-update.sh"
+    printf '#!/bin/bash\nDAIMON_NAME="linux-tools-daimon"\nif then\n' > "$fixture"
+    ! daimon_validate_update_file "$fixture"
+}
+test_self_install_source() {
+    load_function daimon_self_install || return 1
+    local dir="$WORK/startup" DAIMON_LOCAL_SCRIPT="$WORK/startup/installed.sh"
+    local DAIMON_OLD_LOCAL_SCRIPT="$WORK/startup/old.sh" DAIMON_UPDATE_URL=''
+    mkdir -p "$dir"
+    cd "$dir" || return 1
+    printf '#!/bin/bash\necho unrelated\n' > linux-toolbox.sh
+    printf '#!/bin/bash\necho installed\n' > "$DAIMON_LOCAL_SCRIPT"
+    local trace="$WORK/self-install.trace"
+    : > "$trace"
+    sed() { :; }
+    chmod() { :; }
+    ln() { :; }
+    cp() { echo "$*" >> "$trace"; }
+    daimon_install_script_file() { echo "$*" >> "$trace"; }
+    daimon_self_install || true
+    ! grep -qE '(^| )\./linux-toolbox\.sh ' "$trace"
+}
+test_atomic_script_install() {
+    load_function daimon_validate_update_file || return 1
+    load_function daimon_install_script_file || return 1
+    local source="$WORK/replacement.sh" target="$WORK/running.sh" original
+    printf '#!/bin/bash\nDAIMON_NAME="linux-tools-daimon"\necho replacement\n' > "$source"
+    printf 'original\n' > "$target"
+    exec 3< "$target"
+    daimon_install_script_file "$source" "$target" || return 1
+    read -r original <&3
+    exec 3<&-
+    [ "$original" = original ] && cmp -s "$source" "$target"
+}
+test_ssh_key_names() {
+    load_function ssh_private_key_name_valid || return 1
+    local name
+    for name in ../id /tmp/id authorized_keys known_hosts config id.pub . .. ''; do
+        ! ssh_private_key_name_valid "$name" || return 1
+    done
+    ssh_private_key_name_valid id_ed25519
+}
+test_ssh_allow_order() {
+    load_function ssh_config_manager || return 1
+    local trace="$WORK/ssh-order.trace" count=0 SSH_CONNECTION='a 1 b 64400'
+    : > "$trace"
+    sshd() { echo 'port 64400'; }
+    ss() { :; }
+    ufw() { :; }
+    read() {
+        count=$((count + 1))
+        case "$count" in
+            1)
+                ssh_config_backup() { :; }
+                ssh_set_option() { echo write >> "$trace"; }
+                ssh_restart_safe() { echo restart >> "$trace"; }
+                ufw_allow_current_ssh() { echo allow >> "$trace"; return 1; }
+                printf -v "${@: -1}" 1 ;;
+            2) printf -v "${@: -1}" 64401 ;;
+            *) printf -v "${@: -1}" 0 ;;
+        esac
+    }
+    ssh_config_manager || return 1
+    [ "$(cat "$trace")" = allow ]
+}
 test_swapoff_failure() {
     local trace="$WORK/swap.trace" DAIMON_ROOT_DIR="$WORK"
     : > "$trace"
@@ -367,6 +451,14 @@ check 'jsDelivr normalizes refs/heads raw URLs' test_jsdelivr_refs
 check 'failed download cannot replace a cached file' test_download_preserves_cache
 check 'failed migration preserves source data' test_migration_preserves_source
 check 'package locks are not killed or deleted' test_package_lock
+check 'package failure cannot be hidden by a later success' test_package_failure
+check 'update rejects syntactically invalid scripts' test_update_syntax
+check 'startup ignores unrelated scripts in the working directory' test_self_install_source
+check 'script replacement preserves readers of the old inode' test_atomic_script_install
+check 'SSH private key names reject traversal and reserved files' test_ssh_key_names
+check 'SSH allow failure prevents config write and restart' test_ssh_allow_order
+check 'system tools menu stops on EOF' test_submenu_eof linux_Settings
+check 'one-click menu stops on EOF without using defaults' test_submenu_eof one_click_config_manager
 check 'swapoff failure preserves swap and fstab' test_swapoff_failure
 check 'invalid swap sizes make no changes' test_swap_input
 check 'backup log marker cannot override nonzero exit' test_backup_exit_status
