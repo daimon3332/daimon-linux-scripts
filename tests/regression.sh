@@ -202,6 +202,59 @@ test_ssh_allow_order() {
     ssh_config_manager || return 1
     [ "$(cat "$trace")" = allow ]
 }
+test_shortcut_collision() {
+    load_function linux_Settings || return 1
+    load_function daimon_shortcut_available || true
+    local trace="$WORK/shortcut.trace" count=0
+    : > "$trace"
+    find() { :; }
+    ln() { echo overwrite >> "$trace"; }
+    read() {
+        count=$((count + 1))
+        case "$count" in
+            1) printf -v "${@: -1}" 1 ;;
+            2) printf -v "${@: -1}" bash ;;
+            *) printf -v "${@: -1}" 0 ;;
+        esac
+    }
+    linux_Settings || return 1
+    [ ! -s "$trace" ]
+}
+test_unmount_lookup() {
+    load_function unmount_partition || return 1
+    local trace="$WORK/unmount.trace"
+    : > "$trace"
+    read() { printf -v "${@: -1}" sdb1; }
+    lsblk() { echo /mnt/data; }
+    findmnt() { echo /mnt/data; }
+    umount() { printf '%s\n' "$*" >> "$trace"; }
+    rmdir() { echo remove-directory >> "$trace"; }
+    unmount_partition || return 1
+    [ "$(cat "$trace")" = '/dev/sdb1' ]
+}
+test_regular_user_validation() {
+    load_function daimon_regular_user_valid || return 1
+    id() { case "${@: -1}" in root) echo 0 ;; nobody) echo 65534 ;; alice) echo 1000 ;; *) return 1 ;; esac; }
+    local name
+    for name in root nobody missing ../alice 'alice/path' '-alice' ''; do
+        ! daimon_regular_user_valid "$name" || return 1
+    done
+    daimon_regular_user_valid alice
+}
+test_nginx_menu_no_install() {
+    local fixture="$WORK/cert-nginx.sh" trace="$WORK/nginx-install.trace"
+    awk '/cat > .*cert_nginx.sh.*<<.DAIMON_CERT_NGINX_SCRIPT./ {active=1;next}
+        active && /^DAIMON_CERT_NGINX_SCRIPT$/ {exit} active {print}' "$SOURCE" > "$fixture"
+    [ -s "$fixture" ] || return 1
+    : > "$trace"
+    mkdir -p "$WORK/nginx-home"
+    apt() { echo install >> "$trace"; return 1; }
+    curl() { echo download >> "$trace"; return 1; }
+    export -f apt curl
+    export trace
+    HOME="$WORK/nginx-home" bash "$fixture" <<< 0 || return 1
+    [ ! -s "$trace" ]
+}
 test_swapoff_failure() {
     local trace="$WORK/swap.trace" DAIMON_ROOT_DIR="$WORK"
     : > "$trace"
@@ -228,6 +281,41 @@ test_swap_input() {
         ! add_swap "$input" || return 1
     done
     [ ! -s "$trace" ]
+}
+test_swap_activation_failure() {
+    local DAIMON_ROOT_DIR="$WORK" backing="$WORK/managed-swap" active=1 calls=0
+    printf original > "$backing"
+    daimon_swap_is_managed() { return 0; }
+    daimon_swap_is_active() { [ "$active" -eq 1 ]; }
+    function [() {
+        local args=() arg
+        for arg in "$@"; do
+            if [[ "$arg" = /swapfile ]]; then args+=("$backing"); else args+=("$arg"); fi
+        done
+        builtin [ "${args[@]}"
+    }
+    mv() {
+        local args=() arg
+        for arg in "$@"; do
+            if [[ "$arg" = /swapfile ]]; then args+=("$backing"); else args+=("$arg"); fi
+        done
+        command mv "${args[@]}"
+    }
+    rm() {
+        local args=() arg
+        for arg in "$@"; do
+            if [[ "$arg" = /swapfile ]]; then args+=("$backing"); else args+=("$arg"); fi
+        done
+        command rm "${args[@]}"
+    }
+    stat() { echo fixture-inode; }
+    mktemp() { command mktemp "$WORK/swap.XXXXXX"; }
+    fallocate() { :; }
+    mkswap() { printf replacement > "$1"; }
+    swapoff() { active=0; }
+    swapon() { calls=$((calls + 1)); [ "$calls" -gt 1 ] || return 1; active=1; }
+    ! add_swap 1 || return 1
+    [ "$(cat "$backing")" = original ] && [ "$active" -eq 1 ]
 }
 test_backup_exit_status() {
     docker() {
@@ -457,10 +545,15 @@ check 'startup ignores unrelated scripts in the working directory' test_self_ins
 check 'script replacement preserves readers of the old inode' test_atomic_script_install
 check 'SSH private key names reject traversal and reserved files' test_ssh_key_names
 check 'SSH allow failure prevents config write and restart' test_ssh_allow_order
+check 'shortcut cannot overwrite the bash executable' test_shortcut_collision
+check 'unmount locates the mount by its source device' test_unmount_lookup
+check 'user management rejects system users and path input' test_regular_user_validation
+check 'Nginx menu return does not install acme or packages' test_nginx_menu_no_install
 check 'system tools menu stops on EOF' test_submenu_eof linux_Settings
 check 'one-click menu stops on EOF without using defaults' test_submenu_eof one_click_config_manager
 check 'swapoff failure preserves swap and fstab' test_swapoff_failure
 check 'invalid swap sizes make no changes' test_swap_input
+check 'failed swap activation restores the previous file and activation' test_swap_activation_failure
 check 'backup log marker cannot override nonzero exit' test_backup_exit_status
 check 'failed rclone install cannot report success or create config' test_rclone_failed_installer
 check 'official rclone exit 3 means already current' test_rclone_up_to_date

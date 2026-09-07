@@ -1845,7 +1845,7 @@ daimon_swap_is_managed() {
 
 add_swap() {
 	root_use
-	local new_swap="${1:-}" tmp
+	local new_swap="${1:-}" tmp old_swap="" was_active=0
 	if ! [[ "$new_swap" =~ ^[1-9][0-9]{0,6}$ ]] || [ "$new_swap" -gt 1048576 ]; then
 		echo "虚拟内存大小必须为 1-1048576 MiB 的整数"
 		return 1
@@ -1859,15 +1859,39 @@ add_swap() {
 		rm -f -- "$tmp"
 		return 1
 	fi
-	if daimon_swap_is_active && ! swapoff /swapfile; then
+	mkdir -p "$DAIMON_ROOT_DIR" || { rm -f -- "$tmp"; return 1; }
+	if [ -e /swapfile ]; then
+		old_swap=$(mktemp /swapfile.daimon.old.XXXXXX) || { rm -f -- "$tmp"; return 1; }
+	fi
+	daimon_swap_is_active && was_active=1
+	if [ "$was_active" -eq 1 ] && ! swapoff /swapfile; then
 		rm -f -- "$tmp"
+		[ -z "$old_swap" ] || rm -f -- "$old_swap"
 		echo "swapoff 失败，原虚拟内存和 fstab 保持不变。"
 		return 1
 	fi
-	mv -f -- "$tmp" /swapfile || { rm -f -- "$tmp"; return 1; }
-	mkdir -p "$DAIMON_ROOT_DIR" || return 1
-	stat -c '%d:%i' /swapfile > "$DAIMON_ROOT_DIR/.swapfile-managed" || return 1
-	swapon /swapfile && daimon_swap_is_active || return 1
+	if [ -n "$old_swap" ] && ! mv -f -- /swapfile "$old_swap"; then
+		rm -f -- "$tmp" "$old_swap"
+		[ "$was_active" -eq 0 ] || swapon /swapfile
+		return 1
+	fi
+	if ! mv -f -- "$tmp" /swapfile || ! swapon /swapfile || ! daimon_swap_is_active; then
+		if daimon_swap_is_active && ! swapoff /swapfile; then
+			echo "新 swap 停用失败，原文件保留在: $old_swap"
+			return 1
+		fi
+		rm -f -- "$tmp"
+		if [ -n "$old_swap" ]; then
+			mv -f -- "$old_swap" /swapfile || { echo "恢复失败，原 swap 保留在: $old_swap"; return 1; }
+			[ "$was_active" -eq 0 ] || swapon /swapfile || { echo "原 swap 文件已恢复，但重新启用失败。"; return 1; }
+		else
+			rm -f /swapfile
+		fi
+		echo "新 swap 启用失败，已恢复原文件，fstab 未修改。"
+		return 1
+	fi
+	stat -c '%d:%i' /swapfile > "$DAIMON_ROOT_DIR/.swapfile-managed" || { echo "归属标记写入失败，原文件保留在: $old_swap"; return 1; }
+	[ -z "$old_swap" ] || rm -f -- "$old_swap"
 	sed -i '\|^[[:space:]]*/swapfile[[:space:]]|d' /etc/fstab || return 1
 	echo "/swapfile swap swap defaults 0 0" >> /etc/fstab || return 1
 
@@ -7651,9 +7675,9 @@ mount_partition() {
 unmount_partition() {
 	send_stats "卸载分区"
 	read -e -p "请输入要卸载的分区名称（例如 sda1）: " PARTITION || return 1
-
-	# 检查分区是否已经挂载
-	MOUNT_POINT=$(lsblk -o MOUNTPOINT | grep -w "$PARTITION")
+	[[ "$PARTITION" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 1
+	local MOUNT_POINT
+	MOUNT_POINT=$(findmnt -rn -S "/dev/$PARTITION" -o TARGET)
 	if [ -z "$MOUNT_POINT" ]; then
 		echo "分区未挂载！"
 		return
@@ -7664,9 +7688,9 @@ unmount_partition() {
 
 	if [ $? -eq 0 ]; then
 		echo "分区卸载成功: $MOUNT_POINT"
-		rmdir "$MOUNT_POINT"
 	else
 		echo "分区卸载失败！"
+		return 1
 	fi
 }
 
@@ -8919,6 +8943,7 @@ create_user_with_sshkey() {
 		echo "用法：create_user_with_sshkey <用户名> [true|false]"
 		return 1
 	fi
+	[[ "$new_username" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { echo "用户名格式无效"; return 1; }
 
 	if id "$new_username" >/dev/null 2>&1; then
 		echo "用户已存在: $new_username"
@@ -9418,6 +9443,23 @@ EOF
 # ===== end system tools restored helper functions =====
 
 
+daimon_shortcut_available() {
+	local name="$1" path
+	[[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]] || return 1
+	for path in "/usr/local/bin/$name" "/usr/bin/$name"; do
+		if [ -e "$path" ] || [ -L "$path" ]; then
+			[ "$(readlink -f -- "$path")" = /usr/local/bin/d ] || return 1
+		fi
+	done
+}
+
+daimon_regular_user_valid() {
+	local uid
+	[[ "$1" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || return 1
+	uid=$(id -u -- "$1" 2>/dev/null) || return 1
+	[[ "$uid" =~ ^[0-9]+$ ]] && [ "$uid" -ge 1000 ] && [ "$uid" -ne 65534 ]
+}
+
 linux_Settings() {
 	while true; do
 		clear
@@ -9446,9 +9488,18 @@ linux_Settings() {
 					read -e -p "请输入你的快捷按键（默认 d，输入0退出）: " kuaijiejian || return 1
 					kuaijiejian=${kuaijiejian:-d}
 					[ "$kuaijiejian" = "0" ] && break
-					find /usr/local/bin/ -type l -exec bash -c 'test "$(readlink -f {})" = "/usr/local/bin/d" && rm -f {}' \; 2>/dev/null || true
-					[ "$kuaijiejian" != "d" ] && ln -sf /usr/local/bin/d "/usr/local/bin/$kuaijiejian" 2>/dev/null || true
-					ln -sf /usr/local/bin/d "/usr/bin/$kuaijiejian" >/dev/null 2>&1 || true
+					if ! daimon_shortcut_available "$kuaijiejian"; then
+						echo "快捷键无效或与现有命令冲突，未修改任何文件。"
+						break_end; continue
+					fi
+					root_use
+					find /usr/local/bin/ -maxdepth 1 -type l -exec bash -c 'for link do [ "$(readlink -f -- "$link")" = /usr/local/bin/d ] && rm -f -- "$link"; done' bash {} + 2>/dev/null || true
+					if [ "$kuaijiejian" != d ] && ! ln -sf /usr/local/bin/d "/usr/local/bin/$kuaijiejian"; then
+						echo "快捷键创建失败"; break_end; continue
+					fi
+					if ! ln -sf /usr/local/bin/d "/usr/bin/$kuaijiejian"; then
+						echo "快捷键创建失败"; break_end; continue
+					fi
 					echo "快捷键已设置: $kuaijiejian"
 					send_stats "脚本快捷键已设置"
 					break_end
@@ -9557,9 +9608,17 @@ linux_Settings() {
 					case "$choice" in
 						1) read -e -p "请输入新用户名: " new_username || return 1; [ -n "$new_username" ] && create_user_with_sshkey "$new_username" false ;;
 						2) read -e -p "请输入新用户名: " new_username || return 1; [ -n "$new_username" ] && create_user_with_sshkey "$new_username" true ;;
-						3) read -e -p "请输入用户名: " username || return 1; [ -n "$username" ] && { install sudo; usermod -aG sudo "$username" 2>/dev/null || true; echo "$username ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/$username"; chmod 440 "/etc/sudoers.d/$username"; } ;;
-						4) read -e -p "请输入用户名: " username || return 1; [ -n "$username" ] && { rm -f "/etc/sudoers.d/$username"; sed -i "/^$username\s*ALL=(ALL)/d" /etc/sudoers 2>/dev/null || true; gpasswd -d "$username" sudo 2>/dev/null || true; } ;;
-						5) read -e -p "请输入要删除的用户名: " username || return 1; [ -n "$username" ] && userdel -r "$username" ;;
+						3) read -e -p "请输入用户名: " username || return 1; daimon_regular_user_valid "$username" && { install sudo && usermod -aG sudo "$username" && { echo "$username ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/$username"; chmod 440 "/etc/sudoers.d/$username"; }; } ;;
+						4) read -e -p "请输入用户名: " username || return 1; daimon_regular_user_valid "$username" && { rm -f "/etc/sudoers.d/$username"; sed -i "/^$username\s*ALL=(ALL)/d" /etc/sudoers 2>/dev/null || true; gpasswd -d "$username" sudo 2>/dev/null || true; } ;;
+						5)
+							read -e -p "请输入要删除的用户名: " username || return 1
+							if ! daimon_regular_user_valid "$username" || [ "$username" = "${SUDO_USER:-${USER:-}}" ]; then
+								echo "不能删除系统账号、不存在的账号或当前登录账号。"
+							else
+								read -e -p "再次输入用户名确认删除账号及其主目录: " confirm_user || return 1
+								[ "$confirm_user" = "$username" ] && userdel -r "$username"
+							fi
+							;;
 						0) break ;;
 						*) echo "无效的输入!" ;;
 					esac
@@ -19388,6 +19447,7 @@ issue_cert() {
     local DOMAIN="$1" temp_challenge="" existing_conf="" keylength=""
     local -a issue_args install_args
 
+    install_acme || return 1
     show_dns "$DOMAIN"
 
     validate_domain "$DOMAIN" || { echo -e "${RED}域名格式不正确${NC}"; return 1; }
@@ -19652,9 +19712,8 @@ nginx_domain_migrate_existing_certs() {
 
 # -------------------- 主流程 --------------------
 
-install_acme
-
 if [ "${1:-}" = "--install-renewal" ]; then
+    install_acme
     setup_cron
     echo -e "${GREEN}Nginx + 域名续期脚本已安装${NC}"
     exit 0

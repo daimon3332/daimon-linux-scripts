@@ -129,19 +129,15 @@ grep '^\[BitwardenBackup\]' /var/lib/docker/volumes/vaultwarden-rclone-data/_dat
 ## 2. 系统更新
 
 ```bash
-pkill -9 -f 'apt|dpkg'
-rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock
 DEBIAN_FRONTEND=noninteractive dpkg --configure -a
 DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none apt update -y
 DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none apt full-upgrade -y
 ```
-解释：修复 apt/dpkg 状态，更新软件源并升级系统软件包。
+解释：修复 apt/dpkg 状态，更新软件源并升级系统软件包。锁占用、dpkg 修复或索引更新失败时停止，不强杀进程或删除锁。
 
 ## 3. 系统清理
 
 ```bash
-pkill -9 -f 'apt|dpkg'
-rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock
 DEBIAN_FRONTEND=noninteractive dpkg --configure -a
 apt autoremove --purge -y
 apt clean -y
@@ -370,26 +366,16 @@ free -m
 解释：显示当前 Swap。
 
 ```bash
-swapoff /swapfile
-rm -f /swapfile
-fallocate -l 2048M /swapfile
-chmod 600 /swapfile
-mkswap /swapfile
-swapon /swapfile
-sed -i '/\/swapfile/d' /etc/fstab
-echo "/swapfile swap swap defaults 0 0" >> /etc/fstab
+d swap 2048
 ```
-解释：设置 1024M/2048M/4096M/自定义大小 Swap，数值按用户选择替换。
+解释：先验证大小和 `/root/linux-daimon/.swapfile-managed` inode 标记，再暂存新文件。停用失败不覆盖旧文件，新文件启用失败尝试恢复原文件及启用状态。已有但未标记的 `/swapfile` 不接管，不擦除其他 swap 文件或分区。
 
 删除虚拟内存：
 
 ```bash
-swapoff /swapfile
-rm -f /swapfile
-sed -i '/\/swapfile/d' /etc/fstab
-rm -f /etc/local.d/swap.start
+delete_swap
 ```
-解释：删除脚本创建的 `/swapfile` 虚拟内存，并清理持久化配置；不会主动删除或擦除物理 swap 分区。
+解释：菜单调用 `delete_swap`，只删除 inode 与归属标记一致的 `/swapfile`。`swapoff` 失败时不删文件、不改 fstab；其他 swap 保持不变。
 
 ### 5.6 用户管理
 
@@ -601,16 +587,19 @@ journalctl --vacuum-size=500M
 ```bash
 sysctl -n net.ipv4.tcp_congestion_control
 sysctl -n net.core.default_qdisc
-[ -f /etc/sysctl.d/99-network-optimize.conf ]
+[ -f /etc/sysctl.d/99-daimon-network-optimize.conf ]
+tc qdisc show
 ```
 解释：显示当前拥塞算法、队列算法、是否已安装自定义优化配置。
 
 应用自定义网络优化：
 
 ```bash
-cat > /etc/sysctl.d/99-network-optimize.conf <<EOF
+cat > /etc/sysctl.d/99-daimon-bbr-fq.conf <<EOF
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
+EOF
+cat > /etc/sysctl.d/99-daimon-network-optimize.conf <<EOF
 net.core.rmem_max=134217728
 net.core.wmem_max=134217728
 net.core.netdev_max_backlog=300000
@@ -622,16 +611,16 @@ net.ipv4.tcp_fastopen=3
 net.ipv4.tcp_window_scaling=1
 net.ipv4.tcp_max_syn_backlog=262144
 net.core.somaxconn=65535
-net.ipv4.tcp_low_latency=1
 net.ipv4.ip_local_port_range=1024 65535
 vm.swappiness=10
 net.ipv4.tcp_slow_start_after_idle=0
 net.ipv4.tcp_limit_output_bytes=4194304
 net.ipv4.tcp_mtu_probing=1
 EOF
-sysctl -e -p /etc/sysctl.d/99-network-optimize.conf
+sysctl -p /etc/sysctl.d/99-daimon-bbr-fq.conf
+sysctl -p /etc/sysctl.d/99-daimon-network-optimize.conf
 ```
-解释：使用内置固定参数，不换内核；本地临时端口范围保留 `1024 65535`；只写入 sysctl 配置，不创建 qdisc 服务。
+解释：实际入口为 `daimon_network_apply_custom_optimize`，BBR/FQ 写入 `/etc/sysctl.d/99-daimon-bbr-fq.conf`，其他参数写入 `/etc/sysctl.d/99-daimon-network-optimize.conf`。应用前检查实际默认路由队列为 `fq` 或 `mq+fq`，不覆盖其他队列；失败恢复两个配置文件和逐项保存的运行态参数，回滚不完整时保留快照。已删除内核中无实际作用的 `tcp_low_latency`。
 
 查看优化状态：
 
@@ -644,7 +633,7 @@ modinfo tcp_bbr 2>/dev/null | grep -E '^(filename|version|description):'
 清除自定义网络优化：
 
 ```bash
-rm -f /etc/sysctl.d/99-network-optimize.conf
+rm -f /etc/sysctl.d/99-daimon-network-optimize.conf /etc/sysctl.d/99-network-optimize.conf
 sysctl --system
 ```
 解释：删除本脚本写入的网络优化配置。脚本也会顺手清理旧版本遗留的 qdisc 服务文件；部分运行态参数需要重启后完全恢复系统默认值。
@@ -1579,13 +1568,9 @@ ls -l /root/.config/rclone/rclone.conf
 安装 rclone：
 
 ```bash
-curl https://rclone.org/install.sh | bash
-mkdir -p /root/.config/rclone
-touch /root/.config/rclone/rclone.conf
-chmod 600 /root/.config/rclone/rclone.conf
-rclone --version
+rclone_install_tool
 ```
-解释：安装 rclone，创建空配置文件并设置权限。
+解释：菜单调用 `rclone_install_tool`。CN 使用 GitHub 代理下载官方版本化 ZIP，并验证 SHA256、压缩包、架构和运行版本后原子安装；非 CN 使用带 600 秒执行上限的官方安装器，退出码 3 表示已是最新版。已有 `/usr/local/bin/rclone` 遮蔽官方 `/usr/bin/rclone` 时同步新程序。失败不创建配置、不报成功，已有配置内容保持不变。
 
 修改配置文件：
 
@@ -1667,15 +1652,9 @@ grep '^\[BitwardenBackup\]' /var/lib/docker/volumes/vaultwarden-rclone-data/_dat
 配置 rclone.conf 文件：
 
 ```bash
-mkdir -p /var/lib/docker/volumes/vaultwarden-rclone-data/_data/rclone
-rclone copy qq3303338052@outlook:/rclone.conf /var/lib/docker/volumes/vaultwarden-rclone-data/_data/rclone/
-chmod 600 /var/lib/docker/volumes/vaultwarden-rclone-data/_data/rclone/rclone.conf
-docker run --rm \
-  --mount type=volume,source=vaultwarden-rclone-data,target=/config/ \
-  ttionya/vaultwarden-backup:latest \
-  rclone config show
+bitwarden_configure_rclone_conf
 ```
-解释：复制 rclone.conf 到 Docker volume，并验证输出里包含 `[BitwardenBackup]`、`type = onedrive` 和指定 token 前缀。
+解释：先暂存配置，再通过容器只读挂载执行 `rclone lsd BitwardenBackup:` 实际验证。验证失败保留旧配置，成功后原子更新 Docker volume 中的配置；不会输出完整配置或 token。
 
 数据备份：
 
@@ -1683,7 +1662,7 @@ docker run --rm \
 docker ps --format '{{.Names}}' | grep -qx vaultwarden-backup
 docker exec -i vaultwarden-backup bash /app/backup.sh
 ```
-解释：要求 `vaultwarden-backup` 容器已启动；脚本会检测输出中是否出现 `upload backup file to storage system`。
+解释：要求 `vaultwarden-backup` 容器已启动；备份命令退出码为 0 且输出包含 `upload backup file to storage system` 才算成功。
 
 数据还原：
 

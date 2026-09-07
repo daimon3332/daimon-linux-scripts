@@ -24,6 +24,8 @@ d
 
 之后在服务器命令行输入 `d` 即可打开工具箱。
 
+更新使用主菜单 `00`；不是 `d update`（后者升级系统软件包）。更新会校验 Bash 语法并原子替换快捷命令，启动不会再采用当前目录中的同名旧脚本。交互输入结束时取消当前操作，不按默认选项继续执行。
+
 ## 主菜单顺序
 
 | 序号 | 一级菜单 | 作用 |
@@ -72,7 +74,7 @@ d
 
 ### 系统更新
 
-- 修复 apt/dpkg 中断或锁占用问题。
+- 尝试修复 dpkg 中断；锁被占用或修复失败时停止，不强杀进程或删除锁文件。
 - 执行系统软件包更新和升级。
 
 ### 系统清理
@@ -119,9 +121,15 @@ d
 | 19 | Docker镜像源测速 | 测速默认镜像源、第三方镜像源或两者组合，可选择加入官方镜像源 |
 | 20 | 卸载daimon脚本 | 删除 daimon 本地脚本和快捷命令 |
 
+Swap 只调整带本脚本 inode 归属标记的 `/swapfile`；未标记的已有文件、其他 swap 文件及物理分区保持不变。大小须为 1-1048576 MiB 整数；停用失败不覆盖原文件，新文件启用失败尝试恢复原文件和启用状态。
+
+自定义快捷键不能覆盖已有系统命令。用户权限修改与删除仅接受合法的普通账号（UID 至少 1000，排除 nobody）；删除账号及主目录需要再次输入用户名确认。
+
 #### 系统网络自适应优化参数
 
 现代发行版内核通常已经包含标准 BBR，此时直接加载模块并启用，无需安装新内核。BBR/FQ 配置写入 `/etc/sysctl.d/99-daimon-bbr-fq.conf`，其他网络参数写入 `/etc/sysctl.d/99-daimon-network-optimize.conf`；清除自定义网络优化时保留 BBR/FQ。当前内核不支持 BBR 时不会写入配置或显示成功，可选择进入主菜单 13 安装兼容内核。其他 sysctl 文件定义不同值时只报告覆盖风险，不自动修改用户配置。
+
+应用前还要求默认路由网卡的实际队列为 `fq` 或 `mq` 加全部 `fq` 叶队列；缺少 `tc`、没有默认路由或队列不符时停止，不自动覆盖已有队列。失败会恢复并核对配置文件和运行态参数；回滚不完整时保留快照并明确报错。参数不保证所有线路都变快，2026-09-07 的两机对比未显示 tcpfit 稳定全面胜出，因此保留现有方案，详见 [审计记录](AUDIT.md)。
 
 | 参数 | 参数的含义 | 调优的参数值 | 调优之后的效果 |
 |---|---|---|---|
@@ -138,7 +146,6 @@ d
 | `net.ipv4.tcp_window_scaling` | TCP 窗口缩放 | `1` | 支持更大的 TCP 窗口，提高长肥链路吞吐 |
 | `net.ipv4.tcp_max_syn_backlog` | SYN 半连接队列长度 | `262144` | 提升高并发建连承载能力 |
 | `net.core.somaxconn` | Socket listen 队列上限 | `65535` | 提升服务端连接排队能力 |
-| `net.ipv4.tcp_low_latency` | TCP 低延迟倾向 | `1` | 优先降低延迟，适合交互和转发场景 |
 | `net.ipv4.ip_local_port_range` | 本地临时端口范围 | `1024 65535` | 扩大主动连接可用端口范围 |
 | `vm.swappiness` | Swap 使用倾向 | `10` | 降低系统主动使用 Swap 的概率 |
 | `net.ipv4.tcp_slow_start_after_idle` | 空闲后重新慢启动 | `0` | 避免连接空闲后吞吐重新爬升过慢 |
@@ -271,6 +278,8 @@ Compose 自动更新不会预先执行 `docker compose down`。每个任务使�
 
 ### rclone管理
 
+通过 `ipinfo.io` 判断地区：`CN` 优先用 GitHub 代理获取官方版本化发行包，校验 SHA256、ZIP 和实际可执行版本后原子安装；`HK`、其他地区及未知地区使用官方安装器。所有下载设有超时和失败回退，失败不会创建配置或提示成功。成功安装保留已有配置内容，只设置必要权限。
+
 | 序号 | 选项 | 作用 |
 |---:|---|---|
 | 1 | 安装 rclone | 安装 rclone |
@@ -284,8 +293,8 @@ Compose 自动更新不会预先执行 `docker compose down`。每个任务使�
 
 | 序号 | 选项 | 作用 |
 |---:|---|---|
-| 1 | 配置 rclone.conf 文件 | 从 `qq3303338052@outlook:/rclone.conf` 复制配置到 `vaultwarden-rclone-data` 卷，并验证 `[BitwardenBackup]` |
-| 2 | 数据备份 | 对运行中的 `vaultwarden-backup` 容器执行 `/app/backup.sh`，并检测上传成功字段 |
+| 1 | 配置 rclone.conf 文件 | 暂存下载，通过容器实际连接 `BitwardenBackup:`；成功后原子更新配置，失败保留原配置，不打印 token |
+| 2 | 数据备份 | 对运行中的 `vaultwarden-backup` 容器执行 `/app/backup.sh`；退出码和上传成功字段必须同时满足 |
 | 3 | 数据还原 | 展示 `qq3303338052@outlook:/BitwardenBackup` 下的备份文件，按日期倒序选择后执行 restore |
 | 4 | 配置 Bitwarden 同步脚本 | 写入 `/root/linux-daimon/backup-sh/Vaultwarden_OneDrive_to_Kissska1.sh`，并添加每天 06:00 同步到 `kissska1` 的 crontab |
 | 0 | 返回主菜单 | 返回上一级菜单 |
@@ -344,7 +353,7 @@ Compose 自动更新不会预先执行 `docker compose down`。每个任务使�
 | BBR 管理 | Linux-NetSpeed | `https://raw.githubusercontent.com/ylx2016/Linux-NetSpeed/master/tcpx.sh` | BBR / 网络加速管理 |
 | BBR 管理 | jhb BBRv3 ARM 脚本 | `https://jhb.ovh/jb/bbrv3arm.sh` | ARM 环境 BBRv3 相关处理 |
 | WARP 管理 | fscarmen WARP 菜单脚本 | `https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh` | WARP 安装、管理和彻底删除 |
-| rclone 管理 | rclone 官方安装脚本 | `https://rclone.org/install.sh` | 安装 rclone |
+| rclone 管理（非 CN） | rclone 官方安装脚本 | `https://rclone.org/install.sh` | 安装 rclone；CN 直接下载并校验官方发行包 |
 | SSL/Nginx | acme.sh 官方安装脚本 | `https://get.acme.sh` | 安装 acme.sh，用于申请和续期证书 |
 | LDNMP/网站管理 | 内置 certbot webroot 续期脚本 | `/root/linux-daimon/daimon/auto_cert_renewal.sh` | 仅续期正在运行且已配置 challenge 路径的 Docker Nginx 站点 |
 | Cloudflare | kejilion CF Under Attack 脚本 | `https://raw.githubusercontent.com/kejilion/sh/main/CF-Under-Attack.sh` | Cloudflare 防护模式相关操作 |

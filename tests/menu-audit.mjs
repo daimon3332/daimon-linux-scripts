@@ -3,32 +3,45 @@ import {spawnSync} from 'node:child_process';
 
 const sourcePath = process.env.DAIMON_TEST_SOURCE || 'linux-toolbox.sh';
 const source = Buffer.from(fs.readFileSync(sourcePath, 'utf8').replace(/\r/g, ''));
-const parsed = spawnSync(process.argv[2] || 'shfmt', ['-ln', 'bash', '-tojson'], {
-  input: source, encoding: 'utf8', maxBuffer: 128 * 1024 * 1024,
-});
-if (parsed.status !== 0) throw new Error(parsed.stderr || 'shfmt is required');
-const ast = JSON.parse(parsed.stdout);
+function parse(input) {
+  const parsed = spawnSync(process.argv[2] || 'shfmt', ['-ln', 'bash', '-tojson'], {
+    input, encoding: 'utf8', maxBuffer: 128 * 1024 * 1024,
+  });
+  if (parsed.status !== 0) throw new Error(parsed.stderr || 'shfmt is required');
+  return JSON.parse(parsed.stdout);
+}
 const cases = [];
-const text = node => source.subarray(node.Pos.Offset, node.End.Offset).toString();
-function walk(node, fn = 'CLI') {
+let embedded = 0;
+function walk(node, fn = 'CLI', buffer = source, label = '') {
   if (!node || typeof node !== 'object') return;
+  const text = item => buffer.subarray(item.Pos.Offset, item.End.Offset).toString();
   if (node.Type === 'FuncDecl') fn = node.Name.Value;
+  if (node.Hdoc?.Parts?.every(part => part.Type === 'Lit')) {
+    const script = node.Hdoc.Parts.map(part => part.Value).join('');
+    if (script.startsWith('#!/bin/bash')) {
+      const syntax = spawnSync(process.env.BASH_BIN || 'bash', ['-n'], {input: script, encoding: 'utf8'});
+      if (syntax.status !== 0) throw new Error(syntax.stderr);
+      embedded++;
+      const body = Buffer.from(script);
+      walk(parse(body), 'CLI', body, `${label}embedded@${node.Pos.Line}/`);
+    }
+  }
   if (node.Type === 'CaseClause') {
     const patterns = node.Items.map(item => item.Patterns.map(text));
     const numeric = patterns.flat().some(pattern => /^\d+$/.test(pattern));
     const cli = fn === 'CLI' && text(node.Word) === '$1';
     if ((numeric || cli) && patterns.flat().every(pattern =>
       /^(?:[\p{L}\p{N}_.-]+|\*|""|'')$/u.test(pattern))) {
-      cases.push({fn, line: node.Pos.Line, selector: text(node.Word), patterns});
+      cases.push({fn: label + fn, line: node.Pos.Line, selector: text(node.Word), patterns});
     }
   }
   for (const [key, value] of Object.entries(node)) {
     if (key === 'Pos' || key === 'End') continue;
-    if (Array.isArray(value)) value.forEach(child => walk(child, fn));
-    else if (value && typeof value === 'object') walk(value, fn);
+    if (Array.isArray(value)) value.forEach(child => walk(child, fn, buffer, label));
+    else if (value && typeof value === 'object') walk(value, fn, buffer, label);
   }
 }
-walk(ast);
+walk(parse(source));
 const commands = ['set -eu'];
 let checks = 0;
 for (const [index, entry] of cases.entries()) {
@@ -60,4 +73,4 @@ if (process.argv.includes('--inventory')) {
     }
   }
 }
-console.log(`PASS ${checks} patterns in ${cases.length} case blocks; handler side effects are not executed`);
+console.log(`PASS ${checks} patterns in ${cases.length} case blocks; ${embedded} embedded Bash scripts parsed; handler side effects are not executed`);
