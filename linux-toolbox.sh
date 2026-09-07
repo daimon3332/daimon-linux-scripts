@@ -71,16 +71,17 @@ daimon_migrate_path() {
 		/root/daimon|/root/backup|/root/backup-sh|/root/docker-compose-update|/root/.fzf|/root/linux-toolbox.sh|/root/daimon.sh) ;;
 		*) return 0 ;;
 	esac
-	mkdir -p "$(dirname "$new_path")" >/dev/null 2>&1 || true
-	if [ ! -e "$new_path" ] && [ ! -L "$new_path" ]; then
-		mv "$old_path" "$new_path" 2>/dev/null || { cp -a "$old_path" "$new_path" 2>/dev/null && rm -rf "$old_path" 2>/dev/null; } || true
+	[ ! -L "$old_path" ] && [ ! -L "$new_path" ] || return 1
+	case "$(realpath -m -- "$new_path")" in
+		"$(realpath -m -- "$DAIMON_ROOT_DIR")"/*) ;;
+		*) return 1 ;;
+	esac
+	mkdir -p "$(dirname "$new_path")" || return 1
+	# Legacy paths may contain user data. Copy only; never delete conflicts or sources.
+	if [ -d "$old_path" ]; then
+		mkdir -p "$new_path" && cp -an -- "$old_path"/. "$new_path"/
 	else
-		if [ -d "$old_path" ] && [ -d "$new_path" ]; then
-			cp -an "$old_path"/. "$new_path"/ 2>/dev/null || true
-			rm -rf "$old_path" 2>/dev/null || true
-		elif [ ! -d "$old_path" ]; then
-			rm -f "$old_path" 2>/dev/null || true
-		fi
+		cp -an -- "$old_path" "$new_path"
 	fi
 }
 
@@ -94,22 +95,6 @@ daimon_migrate_runtime_layout() {
 	daimon_migrate_path "/root/.fzf" "$DAIMON_FZF_DIR"
 	daimon_migrate_path "/root/linux-toolbox.sh" "$DAIMON_LOCAL_SCRIPT"
 	daimon_migrate_path "/root/daimon.sh" "$DAIMON_OLD_LOCAL_SCRIPT"
-
-	if crontab -l >/tmp/daimon_cron_migrate.$$ 2>/dev/null; then
-		sed -i \
-			-e "s|/root/backup-sh|$DAIMON_BACKUP_SH_DIR|g" \
-			-e "s|/root/docker-compose-update|$DAIMON_DOCKER_COMPOSE_UPDATE_DIR|g" \
-			/tmp/daimon_cron_migrate.$$ 2>/dev/null || true
-		crontab /tmp/daimon_cron_migrate.$$ 2>/dev/null || true
-	fi
-	rm -f /tmp/daimon_cron_migrate.$$ 2>/dev/null || true
-
-	if [ -f "$HOME/.bashrc" ]; then
-		sed -i \
-			-e "s|\$HOME/.fzf|$DAIMON_FZF_DIR|g" \
-			-e "s|~/.fzf|$DAIMON_FZF_DIR|g" \
-			"$HOME/.bashrc" 2>/dev/null || true
-	fi
 
 }
 
@@ -150,6 +135,7 @@ daimon_jsdelivr_url() {
 			path="${url#https://raw.githubusercontent.com/}"
 			owner="${path%%/*}"; path="${path#*/}"
 			repo="${path%%/*}"; path="${path#*/}"
+			path="${path#refs/heads/}"
 			branch="${path%%/*}"; rest="${path#*/}"
 			[ -n "$owner" ] && [ -n "$repo" ] && [ -n "$branch" ] && [ -n "$rest" ] && echo "https://testingcf.jsdelivr.net/gh/${owner}/${repo}@${branch}/${rest}"
 			;;
@@ -192,18 +178,25 @@ daimon_url() {
 daimon_download_to() {
 	local url="$1"
 	local target="$2"
-	local real_url
-	mkdir -p "$(dirname "$target")" >/dev/null 2>&1 || true
+	local download_timeout="${3:-180}" real_url tmp
+	mkdir -p "$(dirname "$target")" || return 1
+	tmp=$(mktemp "${target}.download.XXXXXX") || return 1
 	while IFS= read -r real_url; do
 		[ -z "$real_url" ] && continue
 		echo -e "${gl_kjlan}尝试下载: $real_url${gl_bai}"
-		if curl -fsSL --connect-timeout 10 --retry 2 "$real_url" -o "$target"; then
-			return 0
+		if curl -fsSL --connect-timeout 10 --max-time "$download_timeout" \
+			--speed-limit 1024 --speed-time 15 --retry 1 --retry-max-time "$download_timeout" \
+			"$real_url" -o "$tmp" && [ -s "$tmp" ]; then
+			mv -f -- "$tmp" "$target" && return 0
+			break
 		fi
-		if command -v wget >/dev/null 2>&1 && wget -qO "$target" "$real_url"; then
-			return 0
+		if command -v wget >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1 &&
+			timeout "$download_timeout" wget --timeout=15 --tries=1 -qO "$tmp" "$real_url" && [ -s "$tmp" ]; then
+			mv -f -- "$tmp" "$target" && return 0
+			break
 		fi
 	done < <(daimon_github_url_candidates "$url")
+	rm -f -- "$tmp"
 	return 1
 }
 
@@ -304,7 +297,11 @@ daimon_run_cached_script() {
 	local name="$2"
 	shift 2
 	daimon_download "$url" "$name" || return 1
-	bash "$DAIMON_SCRIPT_DIR/$name" "$@"
+	if [ -n "${DAIMON_SCRIPT_TIMEOUT:-}" ]; then
+		timeout "$DAIMON_SCRIPT_TIMEOUT" bash "$DAIMON_SCRIPT_DIR/$name" "$@"
+	else
+		bash "$DAIMON_SCRIPT_DIR/$name" "$@"
+	fi
 }
 
 
@@ -1821,33 +1818,43 @@ iptables_panel() {
 
 
 
+daimon_swap_is_active() {
+	awk '$1 == "/swapfile" {found=1} END {exit !found}' /proc/swaps
+}
+
+daimon_swap_is_managed() {
+	[ -f "$DAIMON_ROOT_DIR/.swapfile-managed" ] &&
+		[ ! -L /swapfile ] && [ -f /swapfile ] &&
+		[ "$(stat -c '%d:%i' /swapfile)" = "$(cat "$DAIMON_ROOT_DIR/.swapfile-managed")" ]
+}
+
 add_swap() {
-	local new_swap=$1  # 获取传入的参数
-
-	# 获取当前系统中所有的 swap 分区
-	local swap_partitions=$(grep -E '^/dev/' /proc/swaps | awk '{print $1}')
-
-	# 遍历并删除所有的 swap 分区
-	for partition in $swap_partitions; do
-		swapoff "$partition"
-		wipefs -a "$partition"
-		mkswap -f "$partition"
-	done
-
-	# 确保 /swapfile 不再被使用
-	swapoff /swapfile
-
-	# 删除旧的 /swapfile
-	rm -f /swapfile
-
-	# 创建新的 swap 分区
-	fallocate -l ${new_swap}M /swapfile
-	chmod 600 /swapfile
-	mkswap /swapfile
-	swapon /swapfile
-
-	sed -i '/\/swapfile/d' /etc/fstab
-	echo "/swapfile swap swap defaults 0 0" >> /etc/fstab
+	root_use
+	local new_swap="${1:-}" tmp
+	if ! [[ "$new_swap" =~ ^[1-9][0-9]{0,6}$ ]] || [ "$new_swap" -gt 1048576 ]; then
+		echo "虚拟内存大小必须为 1-1048576 MiB 的整数"
+		return 1
+	fi
+	if { [ -e /swapfile ] || [ -L /swapfile ]; } && ! daimon_swap_is_managed; then
+		echo "现有 /swapfile 的归属未确认，未修改；其他 swap 文件和分区保持不变。"
+		return 1
+	fi
+	tmp=$(mktemp /swapfile.daimon.XXXXXX) || return 1
+	if ! chmod 600 "$tmp" || ! fallocate -l "${new_swap}M" "$tmp" || ! mkswap "$tmp"; then
+		rm -f -- "$tmp"
+		return 1
+	fi
+	if daimon_swap_is_active && ! swapoff /swapfile; then
+		rm -f -- "$tmp"
+		echo "swapoff 失败，原虚拟内存和 fstab 保持不变。"
+		return 1
+	fi
+	mv -f -- "$tmp" /swapfile || { rm -f -- "$tmp"; return 1; }
+	mkdir -p "$DAIMON_ROOT_DIR" || return 1
+	stat -c '%d:%i' /swapfile > "$DAIMON_ROOT_DIR/.swapfile-managed" || return 1
+	swapon /swapfile && daimon_swap_is_active || return 1
+	sed -i '\|^[[:space:]]*/swapfile[[:space:]]|d' /etc/fstab || return 1
+	echo "/swapfile swap swap defaults 0 0" >> /etc/fstab || return 1
 
 	if [ -f /etc/alpine-release ]; then
 		echo "nohup swapon /swapfile" > /etc/local.d/swap.start
@@ -1860,9 +1867,17 @@ add_swap() {
 
 delete_swap() {
 	root_use
-	swapoff /swapfile >/dev/null 2>&1 || true
-	rm -f /swapfile
-	sed -i '/\/swapfile/d' /etc/fstab 2>/dev/null || true
+	if ! daimon_swap_is_managed; then
+		echo "未检测到本脚本创建并标记的 /swapfile，未删除任何文件。"
+		return 1
+	fi
+	if daimon_swap_is_active && ! swapoff /swapfile; then
+		echo "swapoff 失败，未删除虚拟内存或修改 fstab。"
+		return 1
+	fi
+	rm -f /swapfile || return 1
+	sed -i '\|^[[:space:]]*/swapfile[[:space:]]|d' /etc/fstab || return 1
+	rm -f "$DAIMON_ROOT_DIR/.swapfile-managed"
 	rm -f /etc/local.d/swap.start 2>/dev/null || true
 	echo -e "${gl_lv}已删除脚本创建的 /swapfile 虚拟内存，并清理 /etc/fstab 持久化配置。${gl_bai}"
 }
@@ -5334,9 +5349,10 @@ set_timedate() {
 
 # 修复dpkg中断问题
 fix_dpkg() {
-	pkill -9 -f 'apt|dpkg'
-	rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock
-	DEBIAN_FRONTEND=noninteractive dpkg --configure -a
+	DEBIAN_FRONTEND=noninteractive dpkg --configure -a || {
+		echo "dpkg 修复失败或正被其他进程占用；请等待现有任务完成后重试，不会强杀进程或删除锁。"
+		return 1
+	}
 }
 
 
@@ -5347,8 +5363,8 @@ linux_update() {
 	elif command -v yum &>/dev/null; then
 		yum -y update
 	elif command -v apt &>/dev/null; then
-		fix_dpkg
-		DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none apt update -y
+		fix_dpkg || return 1
+		DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none apt update -y || return 1
 		DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none apt full-upgrade -y \
 			-o Dpkg::Options::="--force-confdef" \
 			-o Dpkg::Options::="--force-confold"
@@ -5390,8 +5406,8 @@ linux_clean() {
 		journalctl --vacuum-size=500M
 
 	elif command -v apt &>/dev/null; then
-		fix_dpkg
-		DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none apt autoremove --purge -y
+		fix_dpkg || return 1
+		DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none apt autoremove --purge -y || return 1
 		DEBIAN_FRONTEND=noninteractive apt clean -y
 		DEBIAN_FRONTEND=noninteractive apt autoclean -y
 		journalctl --rotate
@@ -8378,7 +8394,29 @@ daimon_network_bbr_supported() {
 
 daimon_network_verify_bbr_fq() {
 	[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" = "bbr" ] &&
-		[ "$(sysctl -n net.core.default_qdisc 2>/dev/null)" = "fq" ]
+		[ "$(sysctl -n net.core.default_qdisc 2>/dev/null)" = "fq" ] &&
+		daimon_network_verify_active_fq
+}
+
+daimon_network_verify_active_fq() {
+	local interfaces iface queues
+	command -v tc >/dev/null 2>&1 || { echo "缺少 tc，无法验证实际队列。" >&2; return 1; }
+	interfaces=$({ ip -o -4 route show default; ip -o -6 route show default; } 2>/dev/null |
+		awk '{for(i=1;i<NF;i++) if($i=="dev") print $(i+1)}' | sort -u)
+	[ -n "$interfaces" ] || { echo "没有默认路由，无法验证实际队列。" >&2; return 1; }
+	for iface in $interfaces; do
+		queues=$(tc qdisc show dev "$iface" 2>/dev/null) || return 1
+		if ! printf '%s\n' "$queues" | awk '
+			$1 == "qdisc" && $2 != "ingress" && $2 != "clsact" {
+				if ($0 ~ / root([[:space:]]|$)/) root=$2
+				if ($0 ~ / parent /) {leaves++; if($2!="fq") other++}
+			}
+			END {exit !(root=="fq" || (root=="mq" && leaves>0 && other==0))}
+		'; then
+			echo "网卡 $iface 的实际队列不是 fq / mq+fq；未覆盖现有队列，请先确认队列配置。" >&2
+			return 1
+		fi
+	done
 }
 
 daimon_network_verify_sysctl_file() {
@@ -8445,6 +8483,7 @@ daimon_network_enable_bbr_fq() {
 		echo "请进入主菜单 13 的 BBR 管理，明确选择并安装适合当前系统的内核。"
 		return 2
 	fi
+	daimon_network_verify_active_fq || return 1
 
 	old_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
 	old_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || true)
@@ -8459,9 +8498,11 @@ daimon_network_enable_bbr_fq() {
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 EOF
-	command install -m 644 "$tmp" "$DAIMON_BBR_FQ_CONF"
+	if ! command install -m 644 "$tmp" "$DAIMON_BBR_FQ_CONF"; then
+		rm -f "$tmp" "$old_conf"
+		return 1
+	fi
 	rm -f "$tmp"
-	printf '%s\n' tcp_bbr > /etc/modules-load.d/bbr.conf
 
 	if sysctl -p "$DAIMON_BBR_FQ_CONF" >/dev/null 2>&1 && daimon_network_verify_bbr_fq; then
 		rm -f "$old_conf"
@@ -8618,23 +8659,28 @@ daimon_network_cleanup_old_qdisc_service() {
 
 daimon_network_apply_custom_optimize() {
 	root_use
-	local tmp old_conf="" key value unsupported=0 status
-	daimon_network_enable_bbr_fq
-	status=$?
-	[ "$status" -eq 0 ] || return "$status"
-	daimon_network_cleanup_old_qdisc_service
-	tmp=$(mktemp) || return 1
-	if [ -f "$DAIMON_NETWORK_OPTIMIZE_CONF" ]; then
-		old_conf=$(mktemp) || { rm -f "$tmp"; return 1; }
-		cp -a "$DAIMON_NETWORK_OPTIMIZE_CONF" "$old_conf"
-	fi
+	local tmp snapshot key value actual file unsupported=0 rollback_failed=0
+	daimon_network_bbr_supported || { echo "当前内核不支持 BBR，未修改配置。"; return 2; }
+	daimon_network_verify_active_fq || return 1
+	snapshot=$(mktemp -d) || return 1
+	tmp="$snapshot/new.conf"
+	for file in "$DAIMON_BBR_FQ_CONF" "$DAIMON_NETWORK_OPTIMIZE_CONF"; do
+		if [ -e "$file" ]; then
+			cp -a "$file" "$snapshot/$(basename "$file")" || { rm -rf "$snapshot"; return 1; }
+		fi
+	done
+	for key in net.core.default_qdisc net.ipv4.tcp_congestion_control; do
+		actual=$(sysctl -n "$key") || { rm -rf "$snapshot"; return 1; }
+		printf '%s=%s\n' "$key" "$actual" >> "$snapshot/runtime.conf"
+	done
 	cat > "$tmp" <<'EOF'
 # linux-tools-daimon custom network optimization
 EOF
 	while IFS='|' read -r key value; do
 		[ -n "$key" ] || continue
-		if sysctl -n "$key" >/dev/null 2>&1; then
+		if actual=$(sysctl -n "$key" 2>/dev/null); then
 			printf '%s=%s\n' "$key" "$value" >> "$tmp"
+			printf '%s=%s\n' "$key" "$actual" >> "$snapshot/runtime.conf"
 		else
 			echo -e "${gl_huang}跳过当前内核不支持的参数: $key${gl_bai}"
 			unsupported=$((unsupported + 1))
@@ -8651,30 +8697,36 @@ net.ipv4.tcp_fastopen|3
 net.ipv4.tcp_window_scaling|1
 net.ipv4.tcp_max_syn_backlog|262144
 net.core.somaxconn|65535
-net.ipv4.tcp_low_latency|1
 net.ipv4.ip_local_port_range|1024 65535
 vm.swappiness|10
 net.ipv4.tcp_slow_start_after_idle|0
 net.ipv4.tcp_limit_output_bytes|4194304
 net.ipv4.tcp_mtu_probing|1
 EOF
-	command install -m 644 "$tmp" "$DAIMON_NETWORK_OPTIMIZE_CONF"
-	rm -f "$tmp"
-
-	if ! sysctl -p "$DAIMON_NETWORK_OPTIMIZE_CONF" >/dev/null ||
+	if ! daimon_network_enable_bbr_fq ||
+		! command install -m 644 "$tmp" "$DAIMON_NETWORK_OPTIMIZE_CONF" ||
+		! sysctl -p "$DAIMON_NETWORK_OPTIMIZE_CONF" >/dev/null ||
 		! daimon_network_verify_sysctl_file "$DAIMON_NETWORK_OPTIMIZE_CONF" ||
 		! daimon_network_verify_bbr_fq; then
-		if [ -n "$old_conf" ]; then
-			cp -a "$old_conf" "$DAIMON_NETWORK_OPTIMIZE_CONF"
+		for file in "$DAIMON_BBR_FQ_CONF" "$DAIMON_NETWORK_OPTIMIZE_CONF"; do
+			if [ -f "$snapshot/$(basename "$file")" ]; then
+				cp -a "$snapshot/$(basename "$file")" "$file" || rollback_failed=1
+			else
+				rm -f "$file" || rollback_failed=1
+			fi
+		done
+		sysctl -p "$snapshot/runtime.conf" >/dev/null || rollback_failed=1
+		daimon_network_verify_sysctl_file "$snapshot/runtime.conf" || rollback_failed=1
+		if [ "$rollback_failed" -eq 0 ]; then
+			rm -rf "$snapshot"
+			echo -e "${gl_hong}网络优化失败，原配置和运行态参数已恢复。${gl_bai}"
 		else
-			rm -f "$DAIMON_NETWORK_OPTIMIZE_CONF"
+			echo -e "${gl_hong}网络优化失败且回滚不完整，快照保留在: $snapshot${gl_bai}"
 		fi
-		rm -f "$old_conf"
-		sysctl --system >/dev/null 2>&1 || true
-		echo -e "${gl_hong}网络优化应用或 BBR/FQ 验证失败，已恢复原配置。${gl_bai}"
 		return 1
 	fi
-	rm -f "$old_conf" "$DAIMON_NETWORK_LEGACY_CONF"
+	rm -rf "$snapshot"
+	rm -f "$DAIMON_NETWORK_LEGACY_CONF"
 	echo -e "${gl_lv}自定义网络优化已应用。只写入 sysctl 参数，配置文件: $DAIMON_NETWORK_OPTIMIZE_CONF${gl_bai}"
 	[ "$unsupported" -gt 0 ] && echo -e "${gl_huang}已自适应跳过 $unsupported 个不受支持的参数。${gl_bai}"
 	daimon_network_show_conflicting_sysctl_configs "$DAIMON_NETWORK_OPTIMIZE_CONF"
@@ -8704,7 +8756,6 @@ daimon_network_show_custom_status() {
 		net.ipv4.tcp_window_scaling \
 		net.ipv4.tcp_max_syn_backlog \
 		net.core.somaxconn \
-		net.ipv4.tcp_low_latency \
 		net.ipv4.ip_local_port_range \
 		vm.swappiness \
 		net.ipv4.tcp_slow_start_after_idle \
@@ -8713,6 +8764,8 @@ daimon_network_show_custom_status() {
 	do
 		printf "  %-38s %s\n" "$key" "$(sysctl -n "$key" 2>/dev/null || echo 未支持)"
 	done
+	echo "实际网卡队列："
+	tc qdisc show 2>/dev/null || echo "  无法读取（需要 tc）"
 	echo "------------------------------------------------"
 	echo "BBR 模块信息："
 	modinfo tcp_bbr 2>/dev/null | grep -E '^(filename|version|description):' || echo "  未检测到 tcp_bbr 模块信息"
@@ -8750,7 +8803,7 @@ one_click_auto_dns_optimize() {
 	country=$(daimon_country)
 	if [ "$country" = "CN" ]; then
 		local dns1_ipv4="223.5.5.5"
-		local dns2_ipv4="183.60.83.19"
+		local dns2_ipv4="119.29.29.29"
 		local dns1_ipv6="2400:3200::1"
 		local dns2_ipv6="2402:4e00::"
 		echo "检测到国家/地区: CN，自动使用国内 DNS 优化"
@@ -8795,7 +8848,7 @@ one_click_config_manager() {
 	}
 
 	one_click_config_run_all() {
-		local nums n
+		local nums n failed=0 DAIMON_DEFER_SHELL_RESTART=1
 		export DEBIAN_FRONTEND=noninteractive
 		export NEEDRESTART_MODE=a
 		export APT_LISTCHANGES_FRONTEND=none
@@ -8806,8 +8859,9 @@ one_click_config_manager() {
 			return
 		fi
 		for n in $nums; do
-			one_click_config_run_item "$n"
+			one_click_config_run_item "$n" || { echo "配置项 $n 执行失败"; failed=1; }
 		done
+		return "$failed"
 	}
 
 	while true; do
@@ -9682,6 +9736,7 @@ linux_tools() {
 
   restart_shell_after_tool_install() {
     reload_shell_configs_safely
+    [ "${DAIMON_DEFER_SHELL_RESTART:-0}" = 1 ] && return 0
     echo -e "${gl_lv}工具安装完成，正在使用 exec bash 重新进入命令行...${gl_bai}"
     exec bash
   }
@@ -11039,19 +11094,23 @@ EOF
   handle_tool_numbers() {
     local action="$1"
     local input="$2"
-    local n id
+    local n id failed=0
     for n in $input; do
       if ! [[ "$n" =~ ^[0-9]+$ ]] || [ "$n" -lt 1 ] || [ "$n" -gt ${#tool_ids[@]} ]; then
         echo "跳过无效编号: $n"
         continue
       fi
-      id="${tool_ids[$((n-1))]}"
+      id="${tool_ids[$((10#$n-1))]}"
       if [ "$action" = "install" ]; then
-        install_tool_by_id "$id"
+        if ! install_tool_by_id "$id" || ! tool_installed "$id"; then
+          echo "工具安装或验证失败: $id"
+          failed=1
+        fi
       else
-        remove_tool_by_id "$id"
+        remove_tool_by_id "$id" || failed=1
       fi
     done
+    return "$failed"
   }
 
   all_tool_numbers() {
@@ -11097,8 +11156,7 @@ EOF
       case $sub_choice in
         1)
           read -e -p "请输入要安装的工具编号（支持多选，空格分隔）: " nums
-          handle_tool_numbers install "$nums"
-          [ -n "$nums" ] && restart_shell_after_tool_install
+          handle_tool_numbers install "$nums" && [ -n "$nums" ] && restart_shell_after_tool_install
           ;;
         2)
           read -e -p "请输入要卸载的工具编号（支持多选，空格分隔）: " nums
@@ -11107,8 +11165,7 @@ EOF
         3)
           nums="$(all_tool_numbers)"
           read -e -i "$nums" -p "请确认/修改要安装的工具编号（默认全选，空格分隔）: " nums
-          handle_tool_numbers install "$nums"
-          [ -n "$nums" ] && restart_shell_after_tool_install
+          handle_tool_numbers install "$nums" && [ -n "$nums" ] && restart_shell_after_tool_install
           ;;
         4)
           nums="$(all_tool_numbers)"
@@ -11134,8 +11191,7 @@ EOF
       ;;
     thirdparty-install-all)
       local tool_ids=("${thirdparty_ids[@]}")
-      handle_tool_numbers install "$(seq 1 ${#tool_ids[@]} | tr '
-' ' ')"
+      handle_tool_numbers install "$(seq 1 ${#tool_ids[@]} | tr '\n' ' ')" || return 1
       restart_shell_after_tool_install
       return
       ;;
@@ -11145,8 +11201,7 @@ EOF
       ;;
     programming-install-all)
       local tool_ids=("${programming_ids[@]}")
-      handle_tool_numbers install "$(seq 1 ${#tool_ids[@]} | tr '
-' ' ')"
+      handle_tool_numbers install "$(seq 1 ${#tool_ids[@]} | tr '\n' ' ')" || return 1
       restart_shell_after_tool_install
       return
       ;;
@@ -18003,6 +18058,34 @@ openclaw_backup_restore_menu() {
 
 
 
+ssh_current_ports() {
+	local ports
+	ports=$({
+		ss -tlnp 2>/dev/null | awk '/sshd/ {n=split($4,a,":"); print a[n]}'
+		sshd -T 2>/dev/null | awk '$1=="port" {print $2}'
+		[ -n "${SSH_CONNECTION:-}" ] && printf '%s\n' "$SSH_CONNECTION" | awk '{print $4}'
+	} | awk '/^[0-9]+$/ && $1 >= 1 && $1 <= 65535 {print $1}' | sort -nu)
+	[ -n "$ports" ] || { echo "无法识别 SSH 端口，未启用防火墙。" >&2; return 1; }
+	printf '%s\n' "$ports"
+}
+
+ufw_allow_current_ssh() {
+	local ports port
+	command -v ufw >/dev/null 2>&1 || return 1
+	ports=$(ssh_current_ports) || return 1
+	for port in $ports "$@"; do
+		validate_tcp_port "$port" && ufw allow "$port/tcp" || {
+			echo "SSH 端口放行失败，未启用防火墙。" >&2
+			return 1
+		}
+	done
+}
+
+ssh_private_key_name_valid() {
+	validate_config_name "$1" || return 1
+	case "$1" in authorized_keys|known_hosts|known_hosts.old|config|*.pub) return 1 ;; esac
+}
+
 ssh_config_manager() {
 	local SSH_CONFIG="/etc/ssh/sshd_config"
 	local DEFAULT_SSH_PORT="64400"
@@ -18037,16 +18120,8 @@ ssh_config_manager() {
 		elif command systemctl list-unit-files 2>/dev/null | grep -q '^ssh\.service'; then
 			systemctl restart ssh
 		else
-			service sshd restart 2>/dev/null || service ssh restart 2>/dev/null || true
+			service sshd restart 2>/dev/null || service ssh restart 2>/dev/null
 		fi
-	}
-
-	ssh_current_ports() {
-		local ports
-		ports=$(sshd -T 2>/dev/null | awk '$1=="port"{print $2}')
-		[ -z "$ports" ] && ports=$(grep -Ei '^[[:space:]]*Port[[:space:]]+' "$SSH_CONFIG" 2>/dev/null | awk '{print $2}')
-		[ -n "${SSH_CONNECTION:-}" ] && ports="$ports $(echo "$SSH_CONNECTION" | awk '{print $4}')"
-		echo "$ports" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -n -u | xargs
 	}
 
 	ssh_auth_status() {
@@ -18060,8 +18135,8 @@ ssh_config_manager() {
 			echo "未提供公钥，已取消"
 			return 1
 		fi
-		if ! echo "$public_key" | grep -Eq '^ssh-(ed25519|rsa|ecdsa)[[:space:]]+'; then
-			echo -e "${gl_hong}公钥格式不正确，应以 ssh-ed25519、ssh-rsa 或 ssh-ecdsa 开头${gl_bai}"
+		if ! printf '%s\n' "$public_key" | ssh-keygen -lf /dev/stdin >/dev/null 2>&1; then
+			echo -e "${gl_hong}公钥格式或内容无效，未写入 authorized_keys。${gl_bai}"
 			return 1
 		fi
 		mkdir -p /root/.ssh
@@ -18100,8 +18175,24 @@ ssh_config_manager() {
 			case "$sub_choice" in
 				1) read -e -p "请粘贴公钥: " public_key; ssh_add_public_key "$public_key" ;;
 				2) read -e -p "请输入要删除的公钥行号: " line_no; [[ "$line_no" =~ ^[0-9]+$ ]] && sed -i "${line_no}d" /root/.ssh/authorized_keys ;;
-				3) read -e -p "请输入私钥文件名（默认 id_ed25519）: " key_name; key_name=${key_name:-id_ed25519}; echo "请粘贴私钥内容，结束后按 Ctrl+D:"; cat > "/root/.ssh/$key_name"; chmod 600 "/root/.ssh/$key_name" ;;
-				4) read -e -p "请输入要删除的私钥文件名: " key_name; [ -n "$key_name" ] && rm -f "/root/.ssh/$key_name" ;;
+				3)
+					read -e -p "请输入私钥文件名（默认 id_ed25519）: " key_name || return 0
+					key_name=${key_name:-id_ed25519}
+					if ! ssh_private_key_name_valid "$key_name" || [ -e "/root/.ssh/$key_name" ] || [ -L "/root/.ssh/$key_name" ]; then
+						echo "文件名无效或文件已存在，未覆盖任何文件。"
+					else
+						echo "请粘贴私钥内容，结束后按 Ctrl+D:"
+						(umask 077; set -o noclobber; cat > "/root/.ssh/$key_name")
+					fi
+					;;
+				4)
+					read -e -p "请输入要删除的私钥文件名: " key_name || return 0
+					if ssh_private_key_name_valid "$key_name" && [ -f "/root/.ssh/$key_name" ] && [ ! -L "/root/.ssh/$key_name" ]; then
+						rm -f -- "/root/.ssh/$key_name"
+					else
+						echo "文件名无效或不是私钥文件，未删除。"
+					fi
+					;;
 				0) return ;;
 				*) echo "无效的输入!" ;;
 			esac
@@ -18132,8 +18223,14 @@ ssh_config_manager() {
 				new_port=${new_port:-$DEFAULT_SSH_PORT}
 				if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1 ] && [ "$new_port" -le 65535 ]; then
 					ssh_config_backup
+					if command -v ufw >/dev/null 2>&1 && ! ufw_allow_current_ssh "$new_port"; then
+						break_end; continue
+					fi
 					ssh_set_option Port "$new_port"
-					ssh_restart_safe && { command -v ufw >/dev/null 2>&1 && ufw allow "$new_port/tcp"; }
+					if ! ssh_restart_safe; then
+						ssh_restore_backup && ssh_restart_safe
+						echo "新 SSH 配置未能生效，已尝试恢复原配置。"
+					fi
 				else
 					echo "端口不合法"
 				fi
@@ -18183,14 +18280,16 @@ ssh_config_manager() {
 				ssh_set_option ChallengeResponseAuthentication no
 				ssh_set_option PermitEmptyPasswords no
 				ssh_set_option PermitRootLogin prohibit-password
-				install ufw
-				for p in $(ssh_current_ports) "$new_port"; do validate_tcp_port "$p" && ufw allow "$p/tcp" >/dev/null 2>&1 || true; done
-				[ "$new_port" != "22" ] && ufw deny 22/tcp >/dev/null 2>&1 || true
-				echo y | ufw enable >/dev/null 2>&1 || true
-				ufw reload >/dev/null 2>&1 || true
-				if ! ssh_restart_safe; then
+				if ! install ufw || ! ufw_allow_current_ssh "$new_port"; then
 					ssh_restore_backup
-					echo "SSH 重启失败，已恢复原配置"
+					break_end; continue
+				fi
+				if ssh_restart_safe && ufw --force enable; then
+					[ "$new_port" = "22" ] || ufw deny 22/tcp
+					ufw status
+				else
+					ssh_restore_backup && ssh_restart_safe
+					echo "SSH 或 UFW 应用失败，已尝试恢复原 SSH 配置。"
 				fi
 				;;
 			5) ssh_key_manager; continue ;;
@@ -18220,7 +18319,12 @@ ufw_manager() {
 		echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
 		read -e -p "请输入你的选择: " sub_choice
 		case "$sub_choice" in
-			1) root_use; install ufw; for p in $(ssh_current_ports); do validate_tcp_port "$p" && ufw allow "$p/tcp"; done; echo y | ufw enable; ufw status ;;
+			1)
+				root_use
+				if install ufw && ufw_allow_current_ssh; then
+					ufw --force enable && ufw status
+				fi
+				;;
 			2) root_use; ufw disable 2>/dev/null || true; remove ufw; rm -rf /etc/ufw /var/lib/ufw ;;
 			3) root_use; read -e -p "请输入要开放的端口/协议: " port_rule; [ -n "$port_rule" ] && ufw allow "$port_rule"; ufw status numbered ;;
 			4) root_use; read -e -p "请输入要删除的端口/协议: " port_rule; [ -n "$port_rule" ] && ufw delete allow "$port_rule"; ufw status numbered ;;
@@ -19705,19 +19809,73 @@ rclone_status_text() {
 rclone_prepare_config() {
 	local conf_dir="/root/.config/rclone"
 	local conf_file="$conf_dir/rclone.conf"
-	mkdir -p "$conf_dir"
-	touch "$conf_file"
-	chmod 700 "$conf_dir" 2>/dev/null || true
-	chmod 600 "$conf_file" 2>/dev/null || true
+	mkdir -p "$conf_dir" && touch "$conf_file" &&
+		chmod 700 "$conf_dir" && chmod 600 "$conf_file"
 }
+
+rclone_install_cn_release() (
+	local work arch version archive checksum binary target staged
+	case "$(uname -m)" in
+		x86_64|amd64) arch=amd64 ;;
+		aarch64|arm64) arch=arm64 ;;
+		i?86) arch=386 ;;
+		armv7*) arch=arm-v7 ;;
+		armv6*) arch=arm-v6 ;;
+		*) echo "不支持的 rclone 架构: $(uname -m)"; return 1 ;;
+	esac
+	work=$(mktemp -d) || return 1
+	staged=""
+	trap 'rm -rf -- "$work"; [ -z "$staged" ] || rm -f -- "$staged"' EXIT
+	daimon_download_to "https://github.com/rclone/rclone/releases/latest/download/version.txt" "$work/version.txt" 30 || return 1
+	read -r _ version < "$work/version.txt"
+	[[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "rclone 版本信息无效"; return 1; }
+	archive="rclone-$version-linux-$arch.zip"
+	if ! daimon_download_to "https://downloads.rclone.org/$version/SHA256SUMS" "$work/SHA256SUMS" 30; then
+		daimon_download_to "https://github.com/rclone/rclone/releases/download/$version/SHA256SUMS" "$work/SHA256SUMS" 30 || return 1
+	fi
+	checksum=$(awk -v name="$archive" '$2 == name || $2 == "*" name {print $1}' "$work/SHA256SUMS")
+	[[ "$checksum" =~ ^[a-fA-F0-9]{64}$ ]] || { echo "未找到有效的 rclone SHA256 校验值"; return 1; }
+	daimon_download_to "https://github.com/rclone/rclone/releases/download/$version/$archive" "$work/$archive" 300 || return 1
+	printf '%s  %s\n' "$checksum" "$work/$archive" | sha256sum -c - || return 1
+	unzip -tq "$work/$archive" >/dev/null || return 1
+	binary="$work/rclone"
+	unzip -p "$work/$archive" "rclone-$version-linux-$arch/rclone" > "$binary" || return 1
+	chmod 755 "$binary" || return 1
+	[ "$("$binary" version 2>/dev/null | head -n1)" = "rclone $version" ] || return 1
+	target="${DAIMON_RCLONE_BIN_DIR:-/usr/local/bin}/rclone"
+	mkdir -p "$(dirname "$target")" || return 1
+	staged=$(mktemp "${target}.XXXXXX") || return 1
+	command install -m 755 "$binary" "$staged" && mv -f -- "$staged" "$target" || return 1
+	staged=""
+	"$target" version
+)
 
 rclone_install_tool() {
 	root_use
-	install curl unzip
-	daimon_run_cached_script "https://rclone.org/install.sh" "rclone-install.sh"
-	rclone_prepare_config
+	local status=0 active_bin staged
+	install curl unzip || return 1
+	if daimon_is_cn; then
+		rclone_install_cn_release || status=$?
+	else
+		DAIMON_SCRIPT_TIMEOUT=600 daimon_run_cached_script "https://rclone.org/install.sh" "rclone-install.sh" || status=$?
+		active_bin=$(command -v rclone 2>/dev/null || true)
+		if [ "$status" -eq 0 ] && [ "$active_bin" = /usr/local/bin/rclone ]; then
+			/usr/bin/rclone version >/dev/null 2>&1 || return 1
+			staged=$(mktemp /usr/local/bin/rclone.XXXXXX) || return 1
+			if ! command install -m 755 /usr/bin/rclone "$staged" || ! mv -f -- "$staged" "$active_bin"; then
+				rm -f -- "$staged"
+				return 1
+			fi
+		fi
+		[ "$status" -eq 3 ] && status=0
+	fi
+	hash -r
+	if [ "$status" -ne 0 ] || ! command -v rclone >/dev/null 2>&1 || ! rclone version; then
+		echo -e "${gl_hong}rclone 安装失败，现有配置保持不变。${gl_bai}"
+		return 1
+	fi
+	rclone_prepare_config || return 1
 	echo -e "${gl_lv}rclone 安装完成${gl_bai}"
-	rclone version 2>/dev/null || true
 	echo -e "${gl_kjlan}配置文件: /root/.config/rclone/rclone.conf${gl_bai}"
 }
 
@@ -20262,44 +20420,35 @@ bitwarden_check_requirements() {
 	return "$missing"
 }
 
-bitwarden_configure_rclone_conf() {
+bitwarden_configure_rclone_conf() (
 	root_use
-	bitwarden_check_requirements || return
+	bitwarden_check_requirements || return 1
 
 	local target_dir="/var/lib/docker/volumes/vaultwarden-rclone-data/_data/rclone"
-	local verify_output
-	mkdir -p "$target_dir"
+	local work staged=""
+	work=$(mktemp -d) || return 1
+	trap 'rm -rf -- "$work"; [ -z "$staged" ] || rm -f -- "$staged"' EXIT
 
 	echo "正在复制 rclone.conf..."
-	echo "命令: rclone copy qq3303338052@outlook:/rclone.conf $target_dir/"
-	if ! rclone copy "qq3303338052@outlook:/rclone.conf" "$target_dir/"; then
+	if ! rclone copy "qq3303338052@outlook:/rclone.conf" "$work/"; then
 		echo -e "${gl_hong}rclone.conf 复制失败，请检查 rclone 远程配置 qq3303338052@outlook 是否可用。${gl_bai}"
 		return 1
 	fi
-
-	chmod 600 "$target_dir/rclone.conf" 2>/dev/null || true
-
-	echo ""
-	echo "正在通过 vaultwarden-backup 容器验证配置..."
-	verify_output=$(docker run --rm \
-		--mount type=volume,source=vaultwarden-rclone-data,target=/config/ \
-		ttionya/vaultwarden-backup:latest \
-		rclone config show 2>&1)
-	echo "$verify_output"
-
-	if echo "$verify_output" | grep -q '^\[BitwardenBackup\]' \
-		&& echo "$verify_output" | grep -q '^type = onedrive' \
-		&& echo "$verify_output" | grep -Fq 'token = {"access_token":"EwB4BMl6'; then
-		echo -e "${gl_lv}验证成功：已检测到 BitwardenBackup / onedrive / 指定 token。${gl_bai}"
-	else
-		echo -e "${gl_hong}验证失败：没有检测到完整的 BitwardenBackup 配置。${gl_bai}"
-		echo -e "${gl_huang}需要至少包含：${gl_bai}"
-		echo '[BitwardenBackup]'
-		echo 'type = onedrive'
-		echo 'token = {"access_token":"EwB4BMl6...'
+	chmod 600 "$work/rclone.conf" || return 1
+	echo "正在验证 BitwardenBackup 远程存储..."
+	if ! docker run --rm \
+		--mount "type=bind,source=$work/rclone.conf,target=/audit-rclone.conf,readonly" \
+		ttionya/vaultwarden-backup:latest rclone --config /audit-rclone.conf \
+		lsd BitwardenBackup: --contimeout 10s --timeout 30s --retries 1 --low-level-retries 1 >/dev/null 2>&1; then
+		echo -e "${gl_hong}BitwardenBackup 连接验证失败，原配置保持不变。${gl_bai}"
 		return 1
 	fi
-}
+	mkdir -p "$target_dir" || return 1
+	staged=$(mktemp "$target_dir/.rclone.conf.XXXXXX") || return 1
+	command install -m 600 "$work/rclone.conf" "$staged" && mv -f -- "$staged" "$target_dir/rclone.conf" || return 1
+	staged=""
+	echo -e "${gl_lv}BitwardenBackup 连接验证成功，配置已更新。${gl_bai}"
+)
 
 bitwarden_backup_data() {
 	root_use
@@ -20315,7 +20464,11 @@ bitwarden_backup_data() {
 
 	local backup_output
 	echo "正在执行备份..."
-	backup_output=$(docker exec -i vaultwarden-backup bash /app/backup.sh 2>&1)
+	if ! backup_output=$(docker exec -i vaultwarden-backup bash /app/backup.sh 2>&1); then
+		echo "$backup_output"
+		echo -e "${gl_hong}备份命令执行失败，请检查容器日志和远程存储。${gl_bai}"
+		return 1
+	fi
 	echo "$backup_output"
 
 	if echo "$backup_output" | grep -q 'upload backup file to storage system'; then
@@ -21247,7 +21400,7 @@ echo -e "${gl_kjlan}00.  ${gl_bai}脚本更新"
 echo -e "${gl_kjlan}------------------------${gl_bai}"
 echo -e "${gl_kjlan}0.   ${gl_bai}退出脚本"
 echo -e "${gl_kjlan}------------------------${gl_bai}"
-read -e -p "请输入你的选择: " choice
+read -e -p "请输入你的选择: " choice || return 0
 pause_after=true
 case $choice in
   1) linux_info ;;

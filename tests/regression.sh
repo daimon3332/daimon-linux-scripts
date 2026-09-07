@@ -1,0 +1,392 @@
+#!/usr/bin/env bash
+set -o pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+mkdir -p "$ROOT/.tmp"
+WORK=$(mktemp -d "$ROOT/.tmp/regression.XXXXXX") || exit 1
+trap 'case "$WORK" in "$ROOT"/.tmp/regression.*) rm -rf -- "$WORK" ;; esac' EXIT
+tr -d '\r' < "${DAIMON_TEST_SOURCE:-$ROOT/linux-toolbox.sh}" > "$WORK/source.sh"
+SOURCE="$WORK/source.sh"
+export TMPDIR="$WORK"
+passed=0 failed=0
+
+# Load definitions only: sourcing the toolbox itself would run system migrations.
+load_function() {
+    local name="$1" body
+    body=$(awk -v name="$name" '
+        $0 ~ "^[[:space:]]*" name "\\(\\) [({]" {
+            active=1; match($0, /[^[:space:]]/); indent=substr($0, 1, RSTART-1)
+            close_char=($0 ~ /\($/ ? ")" : "}")
+        }
+        active {print}
+        active && $0 == indent close_char {exit}
+    ' "$SOURCE")
+    [ -n "$body" ] && bash -n <<< "$body" && eval "$body"
+}
+
+root_use() { :; }
+clear() { :; }
+send_stats() { :; }
+break_end() { :; }
+
+check() {
+    local name="$1"; shift
+    [[ "$name" == *"${DAIMON_TEST_FILTER:-}"* ]] || return 0
+    if ( "$@" ) > "$WORK/test.out" 2>&1; then
+        printf 'PASS %s\n' "$name"
+        [ "${DAIMON_TEST_VERBOSE:-0}" = 1 ] && cat "$WORK/test.out"
+        passed=$((passed + 1))
+    else
+        printf 'FAIL %s\n' "$name"
+        cat "$WORK/test.out"
+        failed=$((failed + 1))
+    fi
+}
+
+for fn in validate_tcp_port validate_config_name daimon_strip_github_proxy \
+    daimon_jsdelivr_url daimon_github_url_candidates daimon_download_to \
+    daimon_migrate_path fix_dpkg add_swap delete_swap bitwarden_backup_data \
+    rclone_install_tool daimon_network_verify_bbr_fq ufw_manager \
+    one_click_config_manager restart_shell_after_tool_install kejilion_sh; do
+    load_function "$fn" || exit 1
+done
+# Optional on the unfixed revision, required by its callers after the fix.
+for fn in ssh_current_ports ufw_allow_current_ssh daimon_network_verify_active_fq \
+    rclone_install_cn_release daimon_network_apply_custom_optimize \
+    daimon_network_verify_sysctl_file handle_tool_numbers bitwarden_configure_rclone_conf; do
+    load_function "$fn" || true
+done
+
+test_regions() {
+    daimon_is_cn() { [ "$region" = CN ]; }
+    local region url=https://github.com/rclone/rclone/releases/latest/download/version.txt result
+    for region in CN HK SG ''; do
+        result=$(daimon_github_url_candidates "$url")
+        if [ "$region" = CN ]; then
+            [[ "$result" == "https://gh-proxy.com/$url"$'\n'* ]] || return 1
+        else
+            [ "$result" = "$url" ] || return 1
+        fi
+    done
+}
+test_jsdelivr_refs() {
+    [ "$(daimon_jsdelivr_url https://raw.githubusercontent.com/o/r/refs/heads/main/a.sh)" = \
+      https://testingcf.jsdelivr.net/gh/o/r@main/a.sh ]
+}
+test_download_preserves_cache() {
+    local target="$WORK/cache.sh"
+    printf 'original\n' > "$target"
+    daimon_github_url_candidates() { echo https://invalid.example/script; }
+    curl() {
+        while [ "$#" -gt 0 ]; do
+            if [ "$1" = -o ]; then printf partial > "$2"; break; fi
+            shift
+        done
+        return 28
+    }
+    wget() { printf partial > "$2"; return 1; }
+    ! daimon_download_to https://invalid.example/script "$target" || return 1
+    [ "$(cat "$target")" = original ]
+}
+test_migration_preserves_source() {
+    local DAIMON_ROOT_DIR=/root/linux-daimon
+    local trace="$WORK/migration.trace"
+    : > "$trace"
+    id() { echo 0; }
+    function [() {
+        if [[ "${1:-}" = '!' && "${2:-}" = -e && "${3:-}" = /root/linux-daimon/backup ]]; then return 1; fi
+        case "${1:-}:${2:-}" in
+            -e:/root/backup|-e:/root/linux-daimon/backup|-d:/root/backup|-d:/root/linux-daimon/backup) return 0 ;;
+            -L:*) return 1 ;;
+        esac
+        builtin [ "$@"
+    }
+    mkdir() { :; }
+    realpath() { printf '%s\n' "${@: -1}"; }
+    cp() { echo copy >> "$trace"; return 1; }
+    mv() { echo move >> "$trace"; return 1; }
+    rm() { echo delete >> "$trace"; }
+    daimon_migrate_path /root/backup /root/linux-daimon/backup || true
+    ! grep -qE 'delete|move' "$trace"
+}
+test_package_lock() {
+    local trace="$WORK/package.trace"
+    : > "$trace"
+    pkill() { echo kill >> "$trace"; }
+    rm() { echo remove-lock >> "$trace"; }
+    dpkg() { return 1; }
+    ! fix_dpkg || return 1
+    [ ! -s "$trace" ]
+}
+test_swapoff_failure() {
+    local trace="$WORK/swap.trace" DAIMON_ROOT_DIR="$WORK"
+    : > "$trace"
+    daimon_swap_is_managed() { return 0; }
+    daimon_swap_is_active() { return 0; }
+    swapoff() { return 1; }
+    rm() { echo remove >> "$trace"; }
+    sed() { echo fstab >> "$trace"; }
+    ! delete_swap || return 1
+    [ ! -s "$trace" ]
+}
+test_swap_input() {
+    local trace="$WORK/swap-input.trace" input DAIMON_ROOT_DIR="$WORK"
+    : > "$trace"
+    swapoff() { echo swapoff >> "$trace"; }
+    wipefs() { echo wipefs >> "$trace"; }
+    rm() { echo remove >> "$trace"; }
+    fallocate() { echo allocate >> "$trace"; exit 77; }
+    chmod() { :; }
+    mkswap() { :; }
+    swapon() { :; }
+    sed() { :; }
+    for input in 0 -1 abc 1.5 999999999999999999999999; do
+        ! add_swap "$input" || return 1
+    done
+    [ ! -s "$trace" ]
+}
+test_backup_exit_status() {
+    docker() {
+        if [ "$1" = ps ]; then echo vaultwarden-backup; return 0; fi
+        echo 'upload backup file to storage system'
+        return 1
+    }
+    ! bitwarden_backup_data
+}
+test_rclone_failed_installer() {
+    local prepared=0
+    install() { :; }
+    daimon_is_cn() { return 1; }
+    daimon_run_cached_script() { return 1; }
+    rclone_prepare_config() { prepared=1; }
+    rclone() { echo 'rclone v1.0.0'; }
+    ! rclone_install_tool || return 1
+    [ "$prepared" -eq 0 ]
+}
+test_rclone_up_to_date() {
+    local prepared=0
+    install() { :; }
+    daimon_is_cn() { return 1; }
+    daimon_run_cached_script() { return 3; }
+    rclone_prepare_config() { prepared=1; }
+    rclone() { echo 'rclone v1.75.1'; }
+    rclone_install_tool && [ "$prepared" -eq 1 ]
+}
+test_rclone_release() {
+    local test_arch="$1" corrupt="$2" expected="$3" trace="$WORK/release.trace"
+    local DAIMON_RCLONE_BIN_DIR="$WORK/bin-$test_arch-$corrupt"
+    mkdir -p "$DAIMON_RCLONE_BIN_DIR"
+    printf original > "$DAIMON_RCLONE_BIN_DIR/rclone"
+    : > "$trace"
+    uname() { echo "$test_arch"; }
+    daimon_download_to() {
+        echo "$1" >> "$trace"
+        case "$1" in
+            */version.txt) printf 'rclone v1.75.1\n' > "$2" ;;
+            */SHA256SUMS)
+                local hash
+                hash=$(printf fixture | sha256sum | cut -d' ' -f1)
+                [ "$corrupt" = no ] || hash=$(printf invalid | sha256sum | cut -d' ' -f1)
+                printf '%s  rclone-v1.75.1-linux-%s.zip\n' "$hash" "$expected" > "$2"
+                ;;
+            *.zip) printf fixture > "$2" ;;
+            *) return 1 ;;
+        esac
+    }
+    unzip() {
+        [ "$1" = -tq ] && return 0
+        printf '#!/bin/sh\nprintf "rclone v1.75.1\\n"\n'
+    }
+    if [ "$corrupt" = yes ] || [ "$expected" = unsupported ]; then
+        ! rclone_install_cn_release || return 1
+        [ "$(cat "$DAIMON_RCLONE_BIN_DIR/rclone")" = original ]
+    else
+        rclone_install_cn_release || return 1
+        grep -q "rclone-v1.75.1-linux-$expected.zip" "$trace" &&
+            [ "$("$DAIMON_RCLONE_BIN_DIR/rclone" version)" = 'rclone v1.75.1' ]
+    fi
+}
+test_network_rollback() {
+    local DAIMON_BBR_FQ_CONF="$WORK/bbr.conf" DAIMON_NETWORK_OPTIMIZE_CONF="$WORK/network.conf"
+    local DAIMON_NETWORK_LEGACY_CONF="$WORK/legacy.conf" state="$WORK/sysctl.state" key value
+    printf old-bbr > "$DAIMON_BBR_FQ_CONF"
+    printf old-network > "$DAIMON_NETWORK_OPTIMIZE_CONF"
+    printf '%s\n' net.core.default_qdisc net.ipv4.tcp_congestion_control > "$WORK/keys"
+    awk '/^daimon_network_apply_custom_optimize\(\)/ {active=1}
+        active && /^(net|vm|fs)\.[^|]+\|/ {split($0,a,"|");print a[1]}
+        active && /^}/ {exit}' "$SOURCE" >> "$WORK/keys"
+    while read -r key; do printf '%s=17\n' "$key"; done < "$WORK/keys" > "$state"
+    cp "$state" "$state.original"
+    daimon_network_bbr_supported() { :; }
+    daimon_network_verify_active_fq() { :; }
+    daimon_network_enable_bbr_fq() { printf new-bbr > "$DAIMON_BBR_FQ_CONF"; }
+    daimon_network_verify_bbr_fq() { return 1; }
+    daimon_network_show_conflicting_sysctl_configs() { :; }
+    daimon_network_cleanup_old_qdisc_service() { :; }
+    sysctl() {
+        case "$1" in
+            -n) awk -F= -v k="$2" '$1==k {print $2;found=1} END{exit !found}' "$state" ;;
+            -p)
+                while IFS='=' read -r key value; do
+                    [[ "$key" = net.* || "$key" = fs.* || "$key" = vm.* ]] || continue
+                    awk -F= -v k="$key" '$1!=k' "$state" > "$state.new"
+                    printf '%s=%s\n' "$key" "$value" >> "$state.new"
+                    mv "$state.new" "$state"
+                done < "$2"
+                ;;
+            --system) return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+    ! daimon_network_apply_custom_optimize || return 1
+    [ "$(cat "$DAIMON_BBR_FQ_CONF")" = old-bbr ] || return 1
+    [ "$(cat "$DAIMON_NETWORK_OPTIMIZE_CONF")" = old-network ] || return 1
+    diff -u <(sort "$state.original") <(sort "$state")
+}
+test_tool_numbers() {
+    local mode="$1" trace="$WORK/tools.trace" n
+    local tool_ids=(vim cpcat ctrld starship bat btop tree ripgrep fd fzf blesh yazi fastfetch ncdu nexttrace iperf3)
+    : > "$trace"
+    install_tool_by_id() { echo "$1" >> "$trace"; [ "$mode" != failed ] || [ "$1" != vim ]; }
+    remove_tool_by_id() { echo "$1" >> "$trace"; }
+    tool_installed() { [ "$mode" != failed ] || [ "$1" != vim ]; }
+    case "$mode" in
+        failed) ! handle_tool_numbers install '1 2' ;;
+        leading-zero) handle_tool_numbers install 08 && [ "$(cat "$trace")" = ripgrep ] ;;
+        all)
+            for n in $(seq 1 16); do handle_tool_numbers install "$n" || return 1; done
+            [ "$(wc -l < "$trace")" -eq 16 ] || return 1
+            [ "$(cat "$trace")" = "$(printf '%s\n' "${tool_ids[@]}")" ]
+            ;;
+    esac
+}
+test_bitwarden_config_privacy() {
+    local output
+    bitwarden_check_requirements() { :; }
+    mkdir() { :; }
+    chmod() { :; }
+    rclone() { :; }
+    docker() { echo 'token = {"access_token":"PRIVATE_FIXTURE"}'; return 1; }
+    output=$(bitwarden_configure_rclone_conf 2>&1)
+    [ "$?" -ne 0 ] && [[ "$output" != *PRIVATE_FIXTURE* ]]
+}
+test_main_eof() {
+    local count=0 choice='' DAIMON_CERT_HELPER_MARKER="$WORK/absent"
+    crontab_sync_reconcile_legacy() { :; }
+    read() { count=$((count + 1)); [ "$count" -lt 3 ] || exit 77; return 1; }
+    kejilion_sh </dev/null
+    [ "$count" -eq 1 ]
+}
+test_ufw_unknown_ports() {
+    local trace="$WORK/ufw.trace" SSH_CONNECTION=''
+    : > "$trace"
+    install() { :; }
+    sshd() { return 1; }
+    ss() { return 1; }
+    grep() { return 1; }
+    ufw() { echo "$*" >> "$trace"; }
+    ufw_manager <<< $'1\n0' || return 1
+    ! command grep -q enable "$trace"
+}
+test_ufw_allow_failure() {
+    local trace="$WORK/ufw-allow.trace" SSH_CONNECTION='198.51.100.1 12345 192.0.2.1 64400'
+    : > "$trace"
+    install() { :; }
+    ssh_current_ports() { echo 64400; }
+    ufw() { echo "$*" >> "$trace"; [ "${1:-}" != allow ]; }
+    ufw_manager <<< $'1\n0' || return 1
+    ! grep -q enable "$trace"
+}
+test_active_qdisc() {
+    local mode="$1"
+    sysctl() {
+        case "$*" in *tcp_congestion_control*) echo bbr ;; *default_qdisc*) echo fq ;; esac
+    }
+    ip() { echo 'default via 192.0.2.1 dev eth0'; }
+    tc() {
+        if [ "$mode" = good ]; then
+            printf '%s\n' 'qdisc mq 0: root' 'qdisc fq 0: parent :1' 'qdisc fq 0: parent :2'
+        else
+            echo 'qdisc fq_codel 0: root'
+        fi
+    }
+    if [ "$mode" = good ]; then daimon_network_verify_bbr_fq
+    else ! daimon_network_verify_bbr_fq; fi
+}
+test_batch_continues() {
+    local trace="$WORK/batch.trace"
+    : > "$trace"
+    one_click_config_manager <<< 0
+    reload_shell_configs_safely() { :; }
+    exec() { exit 77; }
+    linux_tools() { restart_shell_after_tool_install; }
+    one_click_set_timezone_locale() { echo timezone >> "$trace"; }
+    one_click_config_run_all <<< '9 10'
+    grep -q timezone "$trace"
+}
+test_main_menu() {
+    local number expected trace="$WORK/menu.trace" name
+    crontab_sync_reconcile_legacy() { :; }
+    local DAIMON_CERT_HELPER_MARKER="$WORK/absent"
+    for name in linux_info linux_update linux_clean one_click_config_manager linux_Settings \
+        linux_tools linux_docker ssh_config_manager ufw_manager ssl_nginx_manager fail2ban_manager \
+        linux_bbr warp_manager rclone_manager bitwarden_manager crontab_sync_manager \
+        common_one_click_scripts kejilion_update; do
+        eval "$name() { echo '$name' >> \"\$trace\"; }"
+    done
+    while read -r number expected; do
+        : > "$trace"
+        ( kejilion_sh <<< "$number"$'\n0' ) || return 1
+        [ "$(cat "$trace")" = "$expected" ] || return 1
+    done <<'EOF'
+1 linux_info
+2 linux_update
+3 linux_clean
+4 one_click_config_manager
+5 linux_Settings
+6 linux_tools
+7 linux_tools
+8 linux_docker
+9 ssh_config_manager
+10 ufw_manager
+11 ssl_nginx_manager
+12 fail2ban_manager
+13 linux_bbr
+14 warp_manager
+15 rclone_manager
+16 bitwarden_manager
+17 crontab_sync_manager
+18 common_one_click_scripts
+00 kejilion_update
+0
+EOF
+}
+
+check 'CN proxies; HK, SG and unknown remain direct' test_regions
+check 'jsDelivr normalizes refs/heads raw URLs' test_jsdelivr_refs
+check 'failed download cannot replace a cached file' test_download_preserves_cache
+check 'failed migration preserves source data' test_migration_preserves_source
+check 'package locks are not killed or deleted' test_package_lock
+check 'swapoff failure preserves swap and fstab' test_swapoff_failure
+check 'invalid swap sizes make no changes' test_swap_input
+check 'backup log marker cannot override nonzero exit' test_backup_exit_status
+check 'failed rclone install cannot report success or create config' test_rclone_failed_installer
+check 'official rclone exit 3 means already current' test_rclone_up_to_date
+check 'rclone AMD64 release is checked and installed atomically' test_rclone_release x86_64 no amd64
+check 'rclone ARM64 release selects the correct asset' test_rclone_release aarch64 no arm64
+check 'rclone corrupt archive preserves the old executable' test_rclone_release x86_64 yes amd64
+check 'unsupported rclone architecture makes no changes' test_rclone_release unknown no unsupported
+check 'network failure restores runtime values and both config files' test_network_rollback
+check 'all 16 third-party tool IDs are reachable' test_tool_numbers all
+check 'tool index 08 is decimal, not invalid octal' test_tool_numbers leading-zero
+check 'batch tool failure propagates to its caller' test_tool_numbers failed
+check 'Bitwarden config validation never prints credentials' test_bitwarden_config_privacy
+check 'main menu stops safely on EOF' test_main_eof
+check 'UFW cannot enable with unknown SSH ports' test_ufw_unknown_ports
+check 'UFW cannot enable after allow-rule failure' test_ufw_allow_failure
+check 'mq with fq leaf queues passes verification' test_active_qdisc good
+check 'fq_codel does not pass BBR+FQ verification' test_active_qdisc bad
+check 'batch installs continue to timezone step' test_batch_continues
+check 'all 20 main-menu branches dispatch correctly' test_main_menu
+printf '\n%d passed, %d failed\n' "$passed" "$failed"
+[ "$failed" -eq 0 ]
