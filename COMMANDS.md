@@ -143,11 +143,9 @@ apt autoremove --purge -y
 apt clean -y
 apt autoclean -y
 journalctl --rotate
-journalctl --vacuum-time=1s
 journalctl --vacuum-size=500M
-rm -rf /tmp/*
 ```
-解释：修复包管理器状态，清理无用依赖、缓存、journal 日志和临时文件。
+解释：修复包管理器状态，清理无用依赖和包缓存，按已有 500M 上限清理 journal。步骤失败即停止；不清空共享 `/tmp`、`/var/log`，不按 1 秒保留期删除日志。没有 journalctl 时跳过日志清理，opkg 没有统一的安全缓存清理入口时跳过。
 
 ## 4. 一键配置
 
@@ -1370,11 +1368,10 @@ ufw status numbered
 
 ```bash
 apt install -y curl socat lsof dnsutils ufw openssl nginx
-curl -fsSL https://get.acme.sh -o /root/linux-daimon/daimon/acme-install.sh
-sh /root/linux-daimon/daimon/acme-install.sh email=asdad@163.com
+(set -o pipefail; curl -fsSL --connect-timeout 10 --max-time 300 https://get.acme.sh | sh -s email=asdad@163.com)
 ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
 ```
-解释：安装依赖、安装 acme.sh，并设置默认 CA。
+解释：安装依赖、安装 acme.sh，并设置默认 CA。依赖、下载、安装或 CA 配置失败均停止；不会执行用户的 shell 初始化文件。仅进入或返回 Nginx 菜单不会安装依赖。
 
 默认菜单：1 申请证书+配置 nginx；2 删除 nginx 配置+证书；3 申请证书；4 移除证书；5 查看证书列表；6 配置 nginx；7 删除 nginx 配置；8 创建测试页面；9 删除测试页面；10 安装 nginx；11 备份域名+nginx 配置；12 恢复域名+nginx 配置；13 迁移/修复现有证书（webroot）。进入菜单只显示域名备份脚本是否开启；安装 Nginx、申请证书或配置 Nginx 时会自动开启本地单份备份脚本。
 
@@ -1406,6 +1403,7 @@ mkdir -p /var/www/acme-challenge/.well-known/acme-challenge
 apt install -y nginx
 systemctl start nginx
 systemctl enable nginx
+systemctl is-active --quiet nginx
 cat > /etc/nginx/sites-available/配置名
 ln -sf /etc/nginx/sites-available/配置名 /etc/nginx/sites-enabled/
 nginx -t && systemctl reload nginx
@@ -1445,7 +1443,7 @@ rm -f /etc/nginx/sites-enabled/测试名 /etc/nginx/sites-available/测试名
 rm -rf /var/www/测试名
 nginx -t && nginx -s reload
 ```
-解释：创建或删除 Nginx 测试页面。
+解释：先校验测试名称和端口，拒绝已有目录、已有配置及符号链接目标。创建成功后写入 `.daimon-test-page` 归属标记；删除前再次核对标记和真实路径，仅删除本脚本的测试目录，未标记的历史页面和业务目录不会自动删除。启动、重载或文件操作失败不报告成功。
 
 备份/恢复域名和 Nginx 配置：
 

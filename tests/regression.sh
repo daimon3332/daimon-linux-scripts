@@ -126,6 +126,56 @@ test_package_failure() {
     apt() { [ "${*: -1}" != first ]; }
     ! install first second
 }
+test_cleanup_failure() {
+    load_function linux_clean || return 1
+    local manager="$1" failed=0 failure_at=1
+    [ "$manager" != apt ] || failure_at=2
+    command() {
+        if [ "${1:-}" = -v ]; then
+            [ "$2" = "$manager" ] || [ "$2" = journalctl ]
+        else builtin command "$@"; fi
+    }
+    package() { failed=$((failed + 1)); [ "$failed" -ne "$failure_at" ]; }
+    apt() { package "$@"; }
+    dnf() { package "$@"; }
+    yum() { package "$@"; }
+    apk() { package "$@"; }
+    pacman() { [ "${1:-}" = -Qdtq ] && { echo unused-package; return 0; }; package "$@"; }
+    zypper() { package "$@"; }
+    pkg() { package "$@"; }
+    rpm() { :; }
+    fix_dpkg() { :; }
+    rm() { :; }
+    journalctl() { :; }
+    ! linux_clean
+}
+test_cleanup_boundaries() {
+    load_function linux_clean || return 1
+    local manager="$1" trace="$WORK/cleanup-$1.trace"
+    : > "$trace"
+    command() {
+        if [ "${1:-}" = -v ]; then [ "$2" = "$manager" ]; else builtin command "$@"; fi
+    }
+    apk() { :; }
+    opkg() { :; }
+    pkg() { :; }
+    rm() { printf '%s\n' "$*" >> "$trace"; }
+    linux_clean || return 1
+    [ ! -s "$trace" ]
+}
+test_cleanup_journal() {
+    load_function linux_clean || return 1
+    local trace="$WORK/journal-clean.trace"
+    : > "$trace"
+    command() {
+        if [ "${1:-}" = -v ]; then [ "$2" = apt ] || [ "$2" = journalctl ]; else builtin command "$@"; fi
+    }
+    fix_dpkg() { :; }
+    apt() { :; }
+    journalctl() { printf '%s\n' "$*" >> "$trace"; }
+    linux_clean || return 1
+    ! grep -q -- '--vacuum-time=1s' "$trace" && grep -q -- '--vacuum-size=500M' "$trace"
+}
 test_submenu_eof() {
     local name="$1" count=0 sub_choice='' choice=''
     load_function "$name" || return 1
@@ -241,19 +291,134 @@ test_regular_user_validation() {
     done
     daimon_regular_user_valid alice
 }
-test_nginx_menu_no_install() {
-    local fixture="$WORK/cert-nginx.sh" trace="$WORK/nginx-install.trace"
+load_nginx_functions() {
+    local fixture="$WORK/nginx-functions.sh"
     awk '/cat > .*cert_nginx.sh.*<<.DAIMON_CERT_NGINX_SCRIPT./ {active=1;next}
-        active && /^DAIMON_CERT_NGINX_SCRIPT$/ {exit} active {print}' "$SOURCE" > "$fixture"
+        active && /^if .*--install-renewal/ {exit}
+        active && $0 != "set -e" {print}' "$SOURCE" > "$fixture"
+    [ -s "$fixture" ] && bash -n "$fixture" && source "$fixture"
+}
+test_nginx_menu_no_install() {
+    local mode="${1:-return}" fixture="$WORK/nginx-wrapper.sh" trace="$WORK/nginx-install.trace" status=0
+    awk '/^ssl_nginx_manager\(\)/ {active=1} active {print}
+        active && /^DAIMON_CERT_NGINX_SCRIPT$/ {closed=1}
+        active && closed && /^}/ {exit}' "$SOURCE" > "$fixture"
     [ -s "$fixture" ] || return 1
+    printf '\nssl_nginx_manager\n' >> "$fixture"
     : > "$trace"
     mkdir -p "$WORK/nginx-home"
     apt() { echo install >> "$trace"; return 1; }
     curl() { echo download >> "$trace"; return 1; }
-    export -f apt curl
-    export trace
-    HOME="$WORK/nginx-home" bash "$fixture" <<< 0 || return 1
+    dnf() { apt "$@"; }
+    yum() { apt "$@"; }
+    systemctl() { echo service >> "$trace"; return 1; }
+    crontab() { [ "${1:-}" = -l ] || echo cron-write >> "$trace"; return 1; }
+    export -f apt curl dnf yum systemctl crontab
+    export trace HOME="$WORK/nginx-home" DAIMON_SCRIPT_DIR="$WORK/nginx-scripts"
+    export DAIMON_BACKUP_DIR="$WORK/nginx-backup" DAIMON_BACKUP_SH_DIR="$WORK/nginx-backup-sh"
+    export DAIMON_UPDATE_CERT_HELPER_ONLY=0
+    case "$mode" in
+        return) bash "$fixture" <<< 0 || return 1 ;;
+        invalid) bash "$fixture" <<< $'invalid\n\n0' || return 1 ;;
+        eof) bash "$fixture" </dev/null || status=$?; [ "$status" -le 1 ] || return 1 ;;
+    esac
     [ ! -s "$trace" ]
+}
+test_nginx_dependency_failure() {
+    load_nginx_functions || return 1
+    local manager="$1" calls=0
+    command() {
+        if [ "${1:-}" = -v ]; then [ "$2" = "$manager" ]; else builtin command "$@"; fi
+    }
+    apt() { calls=$((calls + 1)); [ "$calls" -gt 1 ]; }
+    dnf() { return 1; }
+    yum() { return 1; }
+    ! install_deps
+}
+test_acme_dependency_failure() {
+    load_nginx_functions || return 1
+    local trace="$WORK/acme-dependency.trace" HOME="$WORK/acme-home" ACME="$WORK/acme-home/acme.sh" status=0
+    mkdir -p "$HOME"
+    : > "$trace"
+    install_deps() { echo dependencies >> "$trace"; return 1; }
+    curl() { echo download >> "$trace"; }
+    sh() { echo installer >> "$trace"; }
+    ( install_acme ) || status=$?
+    [ "$status" -ne 0 ] && [ "$(cat "$trace")" = dependencies ]
+}
+test_nginx_service_failure() {
+    load_nginx_functions || return 1
+    local stage="$1" trace="$WORK/nginx-service.trace"
+    : > "$trace"
+    command() {
+        if [ "${1:-}" = -v ]; then [ "$2" = nginx ]; else builtin command "$@"; fi
+    }
+    systemctl() { echo "$1" >> "$trace"; [ "$1" != "$stage" ]; }
+    nginx_domain_enable_auto_backup() { echo backup >> "$trace"; }
+    ! install_nginx || return 1
+    ! grep -q backup "$trace"
+}
+test_nginx_renewal_failure() {
+    load_nginx_functions || return 1
+    nginx_domain_ensure_renew_cron() { return 1; }
+    ! setup_cron
+}
+test_nginx_config_install_failure() {
+    load_nginx_functions || return 1
+    local body
+    mkdir -p "$WORK/domain/example.com" "$WORK/nginx/sites-available" "$WORK/nginx/sites-enabled"
+    printf fixture > "$WORK/domain/example.com/fullchain.pem"
+    printf fixture > "$WORK/domain/example.com/privkey.pem"
+    body=$(declare -f config_nginx)
+    body=${body//\/root\/domain/$WORK/domain}
+    eval "${body//\/etc\/nginx/$WORK/nginx}"
+    install_nginx() { return 1; }
+    nginx() { :; }
+    systemctl() { :; }
+    ! config_nginx example.com fixture 8080 || return 1
+    [ ! -e "$WORK/nginx/sites-available/fixture" ]
+}
+test_acme_download_failure() {
+    load_nginx_functions || return 1
+    local HOME="$WORK/acme-download" ACME="$WORK/acme-download/acme.sh"
+    mkdir -p "$HOME"
+    install_deps() { :; }
+    curl() { printf 'partial installer\n'; return 28; }
+    sh() { cat >/dev/null; printf '#!/bin/sh\nexit 0\n' > "$ACME"; chmod +x "$ACME"; }
+    ! install_acme
+}
+test_nginx_page_input() {
+    load_nginx_functions || return 1
+    local input_name="$1" input_port="$2" count=0 trace="$WORK/nginx-page.trace" status=0
+    : > "$trace"
+    read() {
+        count=$((count + 1))
+        if [ "$count" -eq 1 ]; then printf -v "${@: -1}" '%s' "$input_name"
+        else printf -v "${@: -1}" '%s' "$input_port"; fi
+    }
+    install_nginx() { echo reached-install >> "$trace"; exit 77; }
+    ( create_test_page ) || status=$?
+    [ "$status" -ne 0 ] && [ ! -s "$trace" ]
+}
+test_nginx_page_ownership() {
+    load_nginx_functions || return 1
+    local mode="$1" body fn count=0 trace="$WORK/page-removal.trace"
+    mkdir -p "$WORK/web/example" "$WORK/nginx/sites-available" "$WORK/nginx/sites-enabled"
+    printf 'business data\n' > "$WORK/web/example/index.html"
+    printf 'server {}\n' > "$WORK/nginx/sites-available/example"
+    [ "$mode" != managed ] || printf 'example\n' > "$WORK/web/example/.daimon-test-page"
+    for fn in remove_test_page nginx_test_page_is_managed; do
+        body=$(declare -f "$fn") || continue
+        body=${body//\/var\/www/$WORK/web}
+        eval "${body//\/etc\/nginx/$WORK/nginx}"
+    done
+    : > "$trace"
+    read() { count=$((count + 1)); if [ "$count" -eq 1 ]; then printf -v "${@: -1}" 1; else printf -v "${@: -1}" y; fi; }
+    rm() { printf '%s\n' "$*" >> "$trace"; }
+    nginx() { :; }
+    remove_test_page || return 1
+    if [ "$mode" = managed ]; then grep -Fq -- "$WORK/web/example" "$trace"
+    else [ ! -s "$trace" ]; fi
 }
 test_swapoff_failure() {
     local trace="$WORK/swap.trace" DAIMON_ROOT_DIR="$WORK"
@@ -540,6 +705,13 @@ check 'failed download cannot replace a cached file' test_download_preserves_cac
 check 'failed migration preserves source data' test_migration_preserves_source
 check 'package locks are not killed or deleted' test_package_lock
 check 'package failure cannot be hidden by a later success' test_package_failure
+for manager in apt dnf yum apk pacman zypper pkg unsupported; do
+    check "cleanup propagates $manager package failure" test_cleanup_failure "$manager"
+done
+for manager in apk opkg pkg; do
+    check "cleanup preserves shared logs and temporary files on $manager" test_cleanup_boundaries "$manager"
+done
+check 'cleanup retains journal history within the existing size limit' test_cleanup_journal
 check 'update rejects syntactically invalid scripts' test_update_syntax
 check 'startup ignores unrelated scripts in the working directory' test_self_install_source
 check 'script replacement preserves readers of the old inode' test_atomic_script_install
@@ -549,6 +721,22 @@ check 'shortcut cannot overwrite the bash executable' test_shortcut_collision
 check 'unmount locates the mount by its source device' test_unmount_lookup
 check 'user management rejects system users and path input' test_regular_user_validation
 check 'Nginx menu return does not install acme or packages' test_nginx_menu_no_install
+check 'Nginx full entry handles invalid input without changes' test_nginx_menu_no_install invalid
+check 'Nginx full entry stops on EOF without changes' test_nginx_menu_no_install eof
+for manager in apt dnf yum; do
+    check "Nginx stops after $manager dependency failure" test_nginx_dependency_failure "$manager"
+done
+check 'Nginx does not download acme after dependency failure' test_acme_dependency_failure
+check 'Nginx start failure cannot report installation success' test_nginx_service_failure start
+check 'Nginx enable failure cannot report installation success' test_nginx_service_failure enable
+check 'Nginx inactive service cannot report installation success' test_nginx_service_failure is-active
+check 'Nginx renewal failure reaches the caller' test_nginx_renewal_failure
+check 'Nginx config is not written after installation failure' test_nginx_config_install_failure
+check 'Nginx acme download failure is not hidden by the installer' test_acme_download_failure
+check 'Nginx test page rejects traversal before installation' test_nginx_page_input ../protected 8080
+check 'Nginx test page rejects injected port before installation' test_nginx_page_input fixture '8080;include bad;'
+check 'Nginx test page removal preserves unowned business directories' test_nginx_page_ownership business
+check 'Nginx test page removal accepts an owned fixture' test_nginx_page_ownership managed
 check 'system tools menu stops on EOF' test_submenu_eof linux_Settings
 check 'one-click menu stops on EOF without using defaults' test_submenu_eof one_click_config_manager
 check 'swapoff failure preserves swap and fstab' test_swapoff_failure

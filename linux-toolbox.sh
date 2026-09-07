@@ -5426,78 +5426,59 @@ linux_update() {
 
 linux_clean() {
 	echo -e "${gl_kjlan}正在系统清理...${gl_bai}"
+	local -a orphaned_packages=()
 	if command -v dnf &>/dev/null; then
-		rpm --rebuilddb
-		dnf autoremove -y
-		dnf clean all
-		dnf makecache
-		journalctl --rotate
-		journalctl --vacuum-time=1s
-		journalctl --vacuum-size=500M
+		rpm --rebuilddb || return 1
+		dnf autoremove -y || return 1
+		dnf clean all || return 1
+		dnf makecache || return 1
 
 	elif command -v yum &>/dev/null; then
-		rpm --rebuilddb
-		yum autoremove -y
-		yum clean all
-		yum makecache
-		journalctl --rotate
-		journalctl --vacuum-time=1s
-		journalctl --vacuum-size=500M
+		rpm --rebuilddb || return 1
+		yum autoremove -y || return 1
+		yum clean all || return 1
+		yum makecache || return 1
 
 	elif command -v apt &>/dev/null; then
 		fix_dpkg || return 1
 		DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none apt autoremove --purge -y || return 1
-		DEBIAN_FRONTEND=noninteractive apt clean -y
-		DEBIAN_FRONTEND=noninteractive apt autoclean -y
-		journalctl --rotate
-		journalctl --vacuum-time=1s
-		journalctl --vacuum-size=500M
+		DEBIAN_FRONTEND=noninteractive apt clean -y || return 1
+		DEBIAN_FRONTEND=noninteractive apt autoclean -y || return 1
 
 	elif command -v apk &>/dev/null; then
 		echo "清理包管理器缓存..."
-		apk cache clean
-		echo "删除系统日志..."
-		rm -rf /var/log/*
-		echo "删除APK缓存..."
-		rm -rf /var/cache/apk/*
-		echo "删除临时文件..."
-		rm -rf /tmp/*
+		apk cache clean || return 1
 
 	elif command -v pacman &>/dev/null; then
-		pacman -Rns $(pacman -Qdtq) --noconfirm
-		pacman -Scc --noconfirm
-		journalctl --rotate
-		journalctl --vacuum-time=1s
-		journalctl --vacuum-size=500M
+		mapfile -t orphaned_packages < <(pacman -Qdtq)
+		if [ "${#orphaned_packages[@]}" -gt 0 ]; then
+			pacman -Rns "${orphaned_packages[@]}" --noconfirm || return 1
+		fi
+		pacman -Scc --noconfirm || return 1
 
 	elif command -v zypper &>/dev/null; then
-		zypper clean --all
-		zypper refresh
-		journalctl --rotate
-		journalctl --vacuum-time=1s
-		journalctl --vacuum-size=500M
+		zypper clean --all || return 1
+		zypper refresh || return 1
 
 	elif command -v opkg &>/dev/null; then
-		echo "删除系统日志..."
-		rm -rf /var/log/*
-		echo "删除临时文件..."
-		rm -rf /tmp/*
+		echo "opkg 没有统一的安全缓存清理入口，跳过。"
 
 	elif command -v pkg &>/dev/null; then
 		echo "清理未使用的依赖..."
-		pkg autoremove -y
+		pkg autoremove -y || return 1
 		echo "清理包管理器缓存..."
-		pkg clean -y
-		echo "删除系统日志..."
-		rm -rf /var/log/*
-		echo "删除临时文件..."
-		rm -rf /tmp/*
+		pkg clean -y || return 1
 
 	else
 		echo "未知的包管理器!"
-		return
+		return 1
 	fi
-	return
+	if command -v journalctl >/dev/null 2>&1; then
+		journalctl --rotate || return 1
+		journalctl --vacuum-size=500M || return 1
+	fi
+	echo "已保留共享日志目录和临时文件，不自动清空 /var/log 或 /tmp。"
+	return 0
 }
 
 
@@ -18607,8 +18588,8 @@ fail2ban_manager() {
 }
 
 ssl_nginx_manager() {
-	mkdir -p "$DAIMON_SCRIPT_DIR"
-	cat > "$DAIMON_SCRIPT_DIR/cert_nginx.sh" <<'DAIMON_CERT_NGINX_SCRIPT'
+	mkdir -p "$DAIMON_SCRIPT_DIR" || return 1
+	cat > "$DAIMON_SCRIPT_DIR/cert_nginx.sh" <<'DAIMON_CERT_NGINX_SCRIPT' || return 1
 #!/bin/bash
 set -e
 
@@ -18631,43 +18612,53 @@ CERT_EXISTED_BEFORE=false
 
 install_deps() {
     if command -v apt >/dev/null 2>&1; then
-        apt update -y
+        apt update -y || return 1
         apt install -y curl socat lsof dnsutils ufw openssl
     elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y curl socat lsof bind-utils ufw openssl || true
+        dnf install -y curl socat lsof bind-utils ufw openssl
     elif command -v yum >/dev/null 2>&1; then
-        yum install -y curl socat lsof bind-utils ufw openssl || true
+        yum install -y curl socat lsof bind-utils ufw openssl
+    else
+        echo -e "${RED}未找到支持的依赖安装器${NC}"
+        return 1
     fi
 }
 
 install_acme() {
     if [ ! -f "$ACME" ]; then
         echo -e "${GREEN}正在安装 acme.sh...${NC}"
-        install_deps
-        curl https://get.acme.sh | sh -s email=asdad@163.com
-        [ -f "$HOME/.bashrc" ] && source "$HOME/.bashrc" || true
-        [ -f "$HOME/.profile" ] && source "$HOME/.profile" || true
-        if [ ! -f "$ACME" ]; then
+        install_deps || return 1
+        if ! (set -o pipefail; curl -fsSL --connect-timeout 10 --max-time 300 https://get.acme.sh | sh -s email=asdad@163.com); then
+            echo -e "${RED}acme.sh 下载或安装失败${NC}"
+            return 1
+        fi
+        if [ ! -x "$ACME" ]; then
             echo -e "${RED}acme.sh 安装失败${NC}"
-            exit 1
+            return 1
         fi
         echo -e "${GREEN}acme.sh 安装成功${NC}"
     else
         echo -e "${GREEN}acme.sh 已安装${NC}"
     fi
-    "$ACME" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
+    "$ACME" --set-default-ca --server letsencrypt >/dev/null 2>&1 || {
+        echo -e "${RED}acme.sh 默认 CA 配置失败${NC}"
+        return 1
+    }
 }
 
 install_nginx() {
     if ! command -v nginx >/dev/null 2>&1; then
         echo -e "${YELLOW}正在安装 nginx...${NC}"
-        apt update -y
-        apt install -y nginx
+        command -v apt >/dev/null 2>&1 || { echo -e "${RED}当前 Nginx 自动安装仅支持 apt${NC}"; return 1; }
+        apt update -y || return 1
+        apt install -y nginx || return 1
+        command -v nginx >/dev/null 2>&1 || return 1
     fi
-    systemctl start nginx 2>/dev/null || true
-    systemctl enable nginx 2>/dev/null || true
+    systemctl start nginx || return 1
+    systemctl enable nginx || return 1
+    systemctl is-active --quiet nginx || return 1
     echo -e "${GREEN}nginx 已安装并启动${NC}"
-    nginx_domain_enable_auto_backup >/dev/null 2>&1 || true
+    nginx_domain_enable_auto_backup >/dev/null 2>&1 || echo -e "${YELLOW}nginx 已启动，但自动备份配置失败${NC}"
 }
 
 ensure_ufw_80() {
@@ -18680,8 +18671,8 @@ ensure_ufw_80() {
 }
 
 nginx_domain_write_renew_script() {
-    mkdir -p "$(dirname "$ACME_RENEW_SCRIPT")" "$(dirname "$ACME_RENEW_LOG")" "$(dirname "$ACME_RENEW_LOCK")"
-    cat > "$ACME_RENEW_SCRIPT" <<'EOF'
+    mkdir -p "$(dirname "$ACME_RENEW_SCRIPT")" "$(dirname "$ACME_RENEW_LOG")" "$(dirname "$ACME_RENEW_LOCK")" || return 1
+    cat > "$ACME_RENEW_SCRIPT" <<'EOF' || return 1
 #!/bin/bash
 set -u
 ACME="${HOME}/.acme.sh/acme.sh"
@@ -18710,8 +18701,8 @@ status=0
 } >> "$LOG_FILE" 2>&1
 exit "$status"
 EOF
-    chmod 700 "$ACME_RENEW_SCRIPT"
-    cat > /etc/logrotate.d/daimon-acme-renew <<EOF
+    chmod 700 "$ACME_RENEW_SCRIPT" || return 1
+    cat > /etc/logrotate.d/daimon-acme-renew <<EOF || return 1
 $ACME_RENEW_LOG {
     daily
     rotate 30
@@ -18725,7 +18716,7 @@ EOF
 }
 
 nginx_domain_ensure_renew_cron() {
-    nginx_domain_write_renew_script
+    nginx_domain_write_renew_script || return 1
     nginx_domain_ensure_crontab || return 1
     local cron_line="0 3 * * * /bin/bash $ACME_RENEW_SCRIPT >> $ACME_RENEW_LOG 2>&1"
     (crontab -l 2>/dev/null | grep -vF 'acme.sh --cron' | grep -vF "$ACME_RENEW_SCRIPT" || true; echo "$cron_line") | crontab -
@@ -19134,15 +19125,22 @@ remove_nginx_and_cert() {
 }
 
 create_test_page() {
-    read -p "请输入测试文件名称: " TEST_NAME
-    [ -z "$TEST_NAME" ] && echo -e "${RED}名称不能为空${NC}" && return 1
-    read -p "请输入测试端口号: " TEST_PORT
-    [ -z "$TEST_PORT" ] && echo -e "${RED}端口号不能为空${NC}" && return 1
+    read -p "请输入测试文件名称: " TEST_NAME || return 1
+    validate_name "$TEST_NAME" || { echo -e "${RED}测试名称格式不合法${NC}"; return 1; }
+    read -p "请输入测试端口号: " TEST_PORT || return 1
+    validate_port "$TEST_PORT" || { echo -e "${RED}测试端口不合法${NC}"; return 1; }
+    local path
+    for path in "/var/www/$TEST_NAME" "/etc/nginx/sites-available/$TEST_NAME" "/etc/nginx/sites-enabled/$TEST_NAME"; do
+        if [ -e "$path" ] || [ -L "$path" ] || [ "$(realpath -m -- "$path")" != "$path" ]; then
+            echo -e "${RED}目标路径已存在或不安全，未覆盖: $path${NC}"
+            return 1
+        fi
+    done
 
-    install_nginx
+    install_nginx || return 1
 
-    mkdir -p "/var/www/$TEST_NAME"
-    cat > "/var/www/$TEST_NAME/index.html" << EOF
+    mkdir "/var/www/$TEST_NAME" || return 1
+    cat > "/var/www/$TEST_NAME/index.html" << EOF || return 1
 <!DOCTYPE html>
 <html>
 <head>
@@ -19156,7 +19154,7 @@ create_test_page() {
 </html>
 EOF
 
-    cat > "/etc/nginx/sites-available/$TEST_NAME" << EOF
+    cat > "/etc/nginx/sites-available/$TEST_NAME" << EOF || return 1
 server {
     listen $TEST_PORT;
     server_name localhost;
@@ -19165,10 +19163,10 @@ server {
 }
 EOF
 
-    ln -sf "/etc/nginx/sites-available/$TEST_NAME" /etc/nginx/sites-enabled/
+    ln -s "/etc/nginx/sites-available/$TEST_NAME" /etc/nginx/sites-enabled/ || return 1
 
-    if nginx -t; then
-        nginx -s reload
+    if nginx -t && nginx -s reload; then
+        printf '%s\n' "$TEST_NAME" > "/var/www/$TEST_NAME/.daimon-test-page" || return 1
         echo -e "${GREEN}=========================================${NC}"
         echo -e "${GREEN}测试页面创建成功！${NC}"
         echo "网页目录: /var/www/$TEST_NAME"
@@ -19180,10 +19178,19 @@ EOF
         echo -e "${GREEN}=========================================${NC}"
     else
         echo -e "${RED}nginx 配置检测失败${NC}"
-        rm -f "/etc/nginx/sites-available/$TEST_NAME"
-        rm -rf "/var/www/$TEST_NAME"
+        rm -f -- "/etc/nginx/sites-available/$TEST_NAME" "/etc/nginx/sites-enabled/$TEST_NAME"
+        rm -rf -- "/var/www/$TEST_NAME"
         return 1
     fi
+}
+
+nginx_test_page_is_managed() {
+    local name="$1" directory="/var/www/$1" config="/etc/nginx/sites-available/$1"
+    validate_name "$name" && [ "$name" != html ] || return 1
+    [ -d "$directory" ] && [ ! -L "$directory" ] && [ -f "$config" ] && [ ! -L "$config" ] || return 1
+    [ "$(realpath -e -- "$directory")" = "$directory" ] && [ "$(realpath -e -- "$config")" = "$config" ] || return 1
+    [ -f "$directory/.daimon-test-page" ] && [ ! -L "$directory/.daimon-test-page" ] || return 1
+    grep -Fxq -- "$name" "$directory/.daimon-test-page"
 }
 
 remove_test_page() {
@@ -19195,8 +19202,7 @@ remove_test_page() {
     for d in /var/www/*/; do
         [ -d "$d" ] || continue
         local name=$(basename "$d")
-        [ "$name" = "html" ] && continue
-        [ -f "/etc/nginx/sites-available/$name" ] || continue
+        nginx_test_page_is_managed "$name" || continue
         tests+=("$name")
         echo "$i) $name"
         ((i++))
@@ -19205,7 +19211,7 @@ remove_test_page() {
     [ ${#tests[@]} -eq 0 ] && echo -e "${YELLOW}暂无测试页面${NC}" && return 0
 
     echo ""
-    read -p "请输入要删除的测试页面编号: " NUM
+    read -p "请输入要删除的测试页面编号: " NUM || return 1
 
     if ! [[ "$NUM" =~ ^[0-9]+$ ]] || [ "$NUM" -lt 1 ] || [ "$NUM" -gt ${#tests[@]} ]; then
         echo -e "${RED}无效选择${NC}"
@@ -19213,14 +19219,14 @@ remove_test_page() {
     fi
 
     local TEST_NAME="${tests[$((NUM-1))]}"
-    read -p "确认删除 $TEST_NAME？[y/n]: " CONFIRM
+    read -p "确认删除 $TEST_NAME？[y/n]: " CONFIRM || return 1
     [ "$CONFIRM" != "y" ] && return 0
 
-    rm -f "/etc/nginx/sites-enabled/$TEST_NAME"
-    rm -f "/etc/nginx/sites-available/$TEST_NAME"
-    rm -rf "/var/www/$TEST_NAME"
+    nginx_test_page_is_managed "$TEST_NAME" || return 1
+    rm -f -- "/etc/nginx/sites-enabled/$TEST_NAME" "/etc/nginx/sites-available/$TEST_NAME" || return 1
+    rm -rf -- "/var/www/$TEST_NAME" || return 1
 
-    nginx -t && nginx -s reload
+    nginx -t && nginx -s reload || return 1
     echo -e "${GREEN}测试页面 $TEST_NAME 已删除${NC}"
 }
 
@@ -19248,8 +19254,8 @@ nginx_domain_has_domains() {
 nginx_domain_write_auto_backup_script() {
     local script_file
     script_file="$(nginx_domain_auto_backup_script)"
-    mkdir -p "$(dirname "$script_file")" /var/log/rclone
-    cat > "$script_file" <<'EOF'
+    mkdir -p "$(dirname "$script_file")" /var/log/rclone || return 1
+    cat > "$script_file" <<'EOF' || return 1
 #!/bin/bash
 set -e
 
@@ -19304,20 +19310,20 @@ EOF
 nginx_domain_ensure_crontab() {
     if ! command -v crontab >/dev/null 2>&1; then
         if command -v apt >/dev/null 2>&1; then
-            apt update -y
-            apt install -y cron
+            apt update -y || return 1
+            apt install -y cron || return 1
         fi
     fi
-    systemctl enable cron >/dev/null 2>&1 || true
-    systemctl start cron >/dev/null 2>&1 || true
-    command -v crontab >/dev/null 2>&1
+    command -v crontab >/dev/null 2>&1 || return 1
+    systemctl enable cron || return 1
+    systemctl start cron
 }
 
 nginx_domain_enable_auto_backup() {
     local script_file cron_line
     script_file="$(nginx_domain_auto_backup_script)"
     cron_line="$(nginx_domain_auto_backup_cron_line)"
-    nginx_domain_write_auto_backup_script
+    nginx_domain_write_auto_backup_script || return 1
     nginx_domain_ensure_crontab || return 1
     (crontab -l 2>/dev/null | grep -vF "$script_file" || true; echo "$cron_line") | crontab -
 }
@@ -19387,7 +19393,7 @@ restore_nginx_domain() {
         return 0
     fi
 
-    install_nginx
+    install_nginx || return 1
 
     restore_backup_item() {
         local src="$1"
@@ -19438,7 +19444,7 @@ restore_nginx_domain() {
 }
 
 setup_cron() {
-    nginx_domain_ensure_renew_cron
+    nginx_domain_ensure_renew_cron || return 1
     echo -e "${GREEN}已配置 webroot 自动续期（每天凌晨3点）${NC}"
 }
 
@@ -19447,10 +19453,9 @@ issue_cert() {
     local DOMAIN="$1" temp_challenge="" existing_conf="" keylength=""
     local -a issue_args install_args
 
+    validate_domain "$DOMAIN" || { echo -e "${RED}域名格式不正确${NC}"; return 1; }
     install_acme || return 1
     show_dns "$DOMAIN"
-
-    validate_domain "$DOMAIN" || { echo -e "${RED}域名格式不正确${NC}"; return 1; }
     CERT_DIR=$(nginx_domain_cert_dir_for_domain "$DOMAIN")
     mkdir -p "$CERT_DIR"
 
@@ -19463,7 +19468,7 @@ issue_cert() {
     ensure_ufw_80
     mkdir -p "$ACME_WEBROOT/.well-known/acme-challenge"
     if ! command -v nginx >/dev/null 2>&1 || ! systemctl is-active nginx >/dev/null 2>&1; then
-        install_nginx
+        install_nginx || return 1
     fi
     if ! nginx_domain_ensure_challenge_route "$DOMAIN"; then
         if nginx_domain_config_exists "$DOMAIN"; then
@@ -19507,7 +19512,7 @@ issue_cert() {
         echo "证书路径: $CERT_DIR"
         ls -la "$CERT_DIR"
         echo -e "${GREEN}=========================================${NC}"
-        setup_cron
+        setup_cron || echo -e "${YELLOW}证书已签发，但自动续期配置失败，请修复后重新配置续期${NC}"
         nginx_domain_enable_auto_backup >/dev/null 2>&1 || true
         return 0
     else
@@ -19534,11 +19539,11 @@ config_nginx() {
         return 1
     fi
 
-    install_nginx
+    install_nginx || return 1
 
     NGINX_CONF="/etc/nginx/sites-available/$NGINX_NAME"
 
-    cat > "$NGINX_CONF" << EOF
+    cat > "$NGINX_CONF" << EOF || return 1
 server {
     listen 80;
     server_name $DOMAIN;
@@ -19576,10 +19581,10 @@ server {
 }
 EOF
 
-    ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/
+    ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/ || return 1
 
     if nginx -t; then
-        systemctl reload nginx
+        systemctl reload nginx || return 1
         echo -e "${GREEN}=========================================${NC}"
         echo -e "${GREEN}nginx 配置成功！${NC}"
         echo "配置文件: $NGINX_CONF"
@@ -19619,7 +19624,7 @@ nginx_domain_migrate_existing_certs() {
     read -p "确认开始迁移？[y/N]: " confirm
     [ "$confirm" = "y" ] || [ "$confirm" = "Y" ] || { echo "已取消"; return 0; }
     read -p "是否创建迁移备份？[y/N]: " backup_confirm
-    install_nginx
+    install_nginx || return 1
     mkdir -p "$ACME_WEBROOT/.well-known/acme-challenge"
     if [ "$backup_confirm" = "y" ] || [ "$backup_confirm" = "Y" ]; then
         backup_root="/root/linux-daimon/backup/nginx-domain"
@@ -19713,8 +19718,8 @@ nginx_domain_migrate_existing_certs() {
 # -------------------- 主流程 --------------------
 
 if [ "${1:-}" = "--install-renewal" ]; then
-    install_acme
-    setup_cron
+    install_acme || exit 1
+    setup_cron || exit 1
     echo -e "${GREEN}Nginx + 域名续期脚本已安装${NC}"
     exit 0
 fi
@@ -19827,7 +19832,7 @@ while true; do
     read -p "按回车键返回主菜单..."
 done
 DAIMON_CERT_NGINX_SCRIPT
-	chmod +x "$DAIMON_SCRIPT_DIR/cert_nginx.sh"
+	chmod +x "$DAIMON_SCRIPT_DIR/cert_nginx.sh" || return 1
 	if [ "${DAIMON_UPDATE_CERT_HELPER_ONLY:-0}" = "1" ]; then
 		if bash "$DAIMON_SCRIPT_DIR/cert_nginx.sh" --install-renewal; then
 			echo -e "${gl_lv}Nginx + 域名续期脚本已更新: $DAIMON_SCRIPT_DIR/cert_nginx.sh${gl_bai}"

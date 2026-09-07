@@ -32,7 +32,7 @@ d
 |---:|---|---|
 | 1 | 系统信息查询 | 查看系统、CPU、内存、硬盘、网络、DNS、IP、SSH、UFW、Docker、Nginx、Fail2ban、rclone、Bitwarden 等信息 |
 | 2 | 系统更新 | 更新软件源并升级系统软件包 |
-| 3 | 系统清理 | 清理缓存、无用依赖、日志和临时文件 |
+| 3 | 系统清理 | 清理软件包缓存、无用依赖及限额 journal 日志 |
 | 4 | 一键配置 | 快速执行系统更新、清理、Swap、DNS、BBR、Docker、网络优化、第三方工具安装、时区和本地语言配置 |
 | 5 | 系统工具 | 管理快捷键、软件源、DNS、Swap、用户、时区、本地语言、主机名、hosts、网卡、日志、IPv6、Docker 镜像源测速等 |
 | 6 | 第三方工具 | 安装/卸载 vim、cpcat、starship、bat、btop、yazi、NextTrace、iperf3 等常用工具 |
@@ -79,7 +79,8 @@ d
 
 ### 系统清理
 
-- 清理无用依赖、软件包缓存、journal 日志、临时文件等。
+- 清理无用依赖、软件包缓存，按原有 500M 上限清理 journal；任一步失败即停止。
+- 不清空共享 `/tmp`、`/var/log`，不按 1 秒保留期删除日志；无安全清理入口的 opkg 跳过。
 
 ### 一键配置
 
@@ -246,8 +247,8 @@ Compose 自动更新不会预先执行 `docker compose down`。每个任务使�
 | 5 | 查看证书列表 | 查看已申请证书 |
 | 6 | 配置 nginx | 只生成 Nginx 配置 |
 | 7 | 删除 nginx 配置 | 删除 Nginx 配置 |
-| 8 | 创建测试页面 | 创建测试页面 |
-| 9 | 删除测试页面 | 删除测试页面 |
+| 8 | 创建测试页面 | 校验名称和端口，不覆盖已有目录或配置 |
+| 9 | 删除测试页面 | 仅删除带本脚本归属标记的测试目录，保留未标记的旧目录 |
 | 10 | 安装 nginx | 安装、启动并设置 Nginx 开机自启 |
 | 11 | 备份域名 + nginx 配置 | 替换最新本地备份 `/root/linux-daimon/backup/nginx-domain/auto_latest` |
 | 12 | 恢复域名 + nginx 配置 | 从 `/root/linux-daimon/backup/nginx-domain/auto_latest` 合并恢复 `sites-available` 和 `/root/domain`，并重建 `sites-enabled` 软链接；同名文件保留本机版本 |
