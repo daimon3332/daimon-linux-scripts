@@ -57,6 +57,12 @@ for fn in ssh_current_ports ufw_allow_current_ssh daimon_network_verify_active_f
     load_function "$fn" || true
 done
 
+for fn in rclone_config_path rclone_restore_name_valid rclone_tree_safe rclone_assert_inactive rclone_require_space \
+    rclone_nginx_prepare rclone_nginx_allow_ports rclone_nginx_cert_valid rclone_nginx_apply \
+    rclone_check_nginx_after_restore; do
+    load_function "$fn" || true
+done
+
 test_regions() {
     daimon_is_cn() { [ "$region" = CN ]; }
     local region url=https://github.com/rclone/rclone/releases/latest/download/version.txt result
@@ -293,16 +299,19 @@ test_regular_user_validation() {
 }
 load_nginx_functions() {
     local fixture="$WORK/nginx-functions.sh"
-    awk '/cat > .*cert_nginx.sh.*<<.DAIMON_CERT_NGINX_SCRIPT./ {active=1;next}
+    awk '/cat .*<<.DAIMON_CERT_NGINX_SCRIPT./ {active=1;next}
         active && /^if .*--install-renewal/ {exit}
         active && $0 != "set -e" {print}' "$SOURCE" > "$fixture"
     [ -s "$fixture" ] && bash -n "$fixture" && source "$fixture"
 }
 test_nginx_menu_no_install() {
     local mode="${1:-return}" fixture="$WORK/nginx-wrapper.sh" trace="$WORK/nginx-install.trace" status=0
+    declare -f rclone_restore_name_valid rclone_tree_safe rclone_assert_inactive rclone_require_space \
+        rclone_nginx_prepare rclone_nginx_allow_ports rclone_nginx_cert_valid rclone_nginx_apply \
+        rclone_check_nginx_after_restore > "$fixture"
     awk '/^ssl_nginx_manager\(\)/ {active=1} active {print}
         active && /^DAIMON_CERT_NGINX_SCRIPT$/ {closed=1}
-        active && closed && /^}/ {exit}' "$SOURCE" > "$fixture"
+        active && closed && /^}/ {exit}' "$SOURCE" >> "$fixture"
     [ -s "$fixture" ] || return 1
     printf '\nssl_nginx_manager\n' >> "$fixture"
     : > "$trace"
@@ -600,6 +609,8 @@ test_tool_numbers() {
 test_bitwarden_config_privacy() {
     local output
     bitwarden_check_requirements() { :; }
+    rclone_config_path() { printf '%s\n' "$WORK/config"; }
+    rclone_select_remote() { return 1; }
     mkdir() { :; }
     chmod() { :; }
     rclone() { :; }

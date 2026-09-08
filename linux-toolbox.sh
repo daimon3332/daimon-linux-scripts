@@ -18589,7 +18589,12 @@ fail2ban_manager() {
 
 ssl_nginx_manager() {
 	mkdir -p "$DAIMON_SCRIPT_DIR" || return 1
-	cat > "$DAIMON_SCRIPT_DIR/cert_nginx.sh" <<'DAIMON_CERT_NGINX_SCRIPT' || return 1
+	{
+	printf '#!/bin/bash\n'
+	declare -f rclone_restore_name_valid rclone_tree_safe rclone_assert_inactive rclone_require_space \
+		rclone_nginx_prepare rclone_nginx_allow_ports rclone_nginx_cert_valid rclone_nginx_apply \
+		rclone_check_nginx_after_restore || return 1
+	cat <<'DAIMON_CERT_NGINX_SCRIPT' || return 1
 #!/bin/bash
 set -e
 
@@ -19393,54 +19398,7 @@ restore_nginx_domain() {
         return 0
     fi
 
-    install_nginx || return 1
-
-    restore_backup_item() {
-        local src="$1"
-        local dst="$2"
-        [ -e "$src" ] || [ -L "$src" ] || return 0
-        mkdir -p "$(dirname "$dst")"
-        if [ -d "$src" ] && [ ! -L "$src" ]; then
-            mkdir -p "$dst"
-            cp -an "$src"/. "$dst"/
-        elif [ ! -e "$dst" ] && [ ! -L "$dst" ]; then
-            cp -a "$src" "$dst"
-        fi
-    }
-
-    rebuild_sites_enabled_links() {
-        local backup_dir="$1"
-        local names=()
-        local name src dst
-        mkdir -p /etc/nginx/sites-enabled
-        if [ -f "$backup_dir/enabled_sites.txt" ]; then
-            mapfile -t names < "$backup_dir/enabled_sites.txt"
-        else
-            mapfile -t names < <(find /etc/nginx/sites-available -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | sort)
-        fi
-        for name in "${names[@]}"; do
-            [ -n "$name" ] && [ "$name" != "." ] && [ "$name" != ".." ] || continue
-            case "$name" in */*|*\\*) continue ;; esac
-            [ "$name" = "default" ] && continue
-            src="/etc/nginx/sites-available/$name"
-            dst="/etc/nginx/sites-enabled/$name"
-            [ -f "$src" ] || continue
-            [ -e "$dst" ] || [ -L "$dst" ] || ln -s "$src" "$dst"
-        done
-    }
-
-    restore_backup_item "$backup_dir/sites-available" "/etc/nginx/sites-available"
-    restore_backup_item "$backup_dir/domain" "/root/domain"
-    rebuild_sites_enabled_links "$backup_dir"
-
-    if nginx -t; then
-        systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || true
-        nginx_domain_sync_auto_backup_state >/dev/null 2>&1 || true
-        echo -e "${GREEN}恢复完成，nginx 配置检查通过。${NC}"
-    else
-        echo -e "${RED}恢复完成，但 nginx -t 检查失败。${NC}"
-        return 1
-    fi
+    rclone_nginx_apply "$backup_dir" all keep
 }
 
 setup_cron() {
@@ -19832,6 +19790,7 @@ while true; do
     read -p "按回车键返回主菜单..."
 done
 DAIMON_CERT_NGINX_SCRIPT
+	} > "$DAIMON_SCRIPT_DIR/cert_nginx.sh" || return 1
 	chmod +x "$DAIMON_SCRIPT_DIR/cert_nginx.sh" || return 1
 	if [ "${DAIMON_UPDATE_CERT_HELPER_ONLY:-0}" = "1" ]; then
 		if bash "$DAIMON_SCRIPT_DIR/cert_nginx.sh" --install-renewal; then
@@ -19891,8 +19850,9 @@ rclone_status_text() {
 }
 
 rclone_prepare_config() {
-	local conf_dir="/root/.config/rclone"
-	local conf_file="$conf_dir/rclone.conf"
+	local conf_dir conf_file
+	conf_file=$(rclone_config_path)
+	conf_dir=$(dirname "$conf_file")
 	mkdir -p "$conf_dir" && touch "$conf_file" &&
 		chmod 700 "$conf_dir" && chmod 600 "$conf_file"
 }
@@ -19960,7 +19920,7 @@ rclone_install_tool() {
 	fi
 	rclone_prepare_config || return 1
 	echo -e "${gl_lv}rclone 安装完成${gl_bai}"
-	echo -e "${gl_kjlan}配置文件: /root/.config/rclone/rclone.conf${gl_bai}"
+	echo -e "${gl_kjlan}配置文件: $(rclone_config_path)${gl_bai}"
 }
 
 rclone_edit_config() {
@@ -19969,9 +19929,9 @@ rclone_edit_config() {
 		echo -e "${gl_huang}rclone 未安装，请先安装。${gl_bai}"
 		return
 	fi
-	rclone_prepare_config
-	vim /root/.config/rclone/rclone.conf
-	chmod 600 /root/.config/rclone/rclone.conf 2>/dev/null || true
+	rclone_prepare_config || return 1
+	vim "$(rclone_config_path)" || return 1
+	chmod 600 "$(rclone_config_path)" || return 1
 	echo -e "${gl_lv}配置文件权限已设置为 600${gl_bai}"
 	echo -e "${gl_kjlan}当前远程存储:${gl_bai}"
 	rclone listremotes 2>/dev/null || true
@@ -20002,14 +19962,179 @@ rclone_restore_name_valid() {
 	local name="$1"
 	[ -n "$name" ] && [ "$name" != "." ] && [ "$name" != ".." ] || return 1
 	case "$name" in
-		*/*|*\\*) return 1 ;;
+		*/*|*\\*|*[[:cntrl:]]*) return 1 ;;
 	esac
 	return 0
 }
 
-rclone_lsd_names() {
-	awk 'NF >= 5 {name=$5; for (i=6; i<=NF; i++) name=name" "$i; print name}' | sed '/^[[:space:]]*$/d'
+rclone_config_path() {
+	printf '%s\n' "${RCLONE_CONFIG:-/root/.config/rclone/rclone.conf}"
 }
+
+rclone_config_remotes() (
+	set -o pipefail
+	rclone --config "$1" config dump --ask-password=false 2>/dev/null | python3 -c '
+import json, sys
+for name, config in sorted(json.load(sys.stdin).items()):
+    kind = config.get("type", "unknown")
+    if all(ord(c) >= 32 and ord(c) != 127 for c in name + kind):
+        print(name + "\t" + kind)
+'
+)
+
+rclone_remote_state() (
+	umask 077
+	local conf="$1" remote="$2" work
+	work=$(mktemp -d) || { echo unknown; return; }
+	trap 'rm -rf -- "$work"' EXIT
+	if ! cp -- "$conf" "$work/rclone.conf" || ! command -v timeout >/dev/null 2>&1; then
+		echo unknown
+		return
+	fi
+	if timeout 25s rclone --config "$work/rclone.conf" lsf "$remote" --dirs-only --max-depth 1 \
+		--ask-password=false --contimeout 8s --timeout 15s --retries 1 --low-level-retries 1 \
+		>/dev/null 2>"$work/error"; then
+		echo valid
+	elif grep -Eqi 'invalid_grant|invalid_client|invalid_token|unauthenticated|401 Unauthorized|InvalidAccessKeyId|SignatureDoesNotMatch' "$work/error"; then
+		echo invalid
+	else
+		echo unknown
+	fi
+)
+
+rclone_state_text() {
+	case "$1" in
+		valid) echo "有效（读取验证）" ;;
+		invalid) echo "无效（认证失败）" ;;
+		*) echo "无法检测（网络、权限或配置）" ;;
+	esac
+}
+
+rclone_load_remote_status() {
+	local conf="${1:-$(rclone_config_path)}" entries name kind state
+	RCLONE_REMOTE_NAMES=() RCLONE_REMOTE_STATES=()
+	command -v rclone >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1 || {
+		echo "需要 rclone 和 python3 才能检查远程存储。"; return 1;
+	}
+	entries=$(rclone_config_remotes "$conf") || { echo "无法读取 rclone 配置；未显示敏感内容。"; return 1; }
+	while IFS=$'\t' read -r name kind; do
+		[ -n "$name" ] || continue
+		state=$(rclone_remote_state "$conf" "$name:")
+		RCLONE_REMOTE_NAMES+=("$name") RCLONE_REMOTE_STATES+=("$state")
+		printf '%2d. %s [%s] %s\n' "${#RCLONE_REMOTE_NAMES[@]}" "$name" "$kind" "$(rclone_state_text "$state")"
+	done <<< "$entries"
+	[ "${#RCLONE_REMOTE_NAMES[@]}" -gt 0 ] || { echo "未配置远程存储。"; return 1; }
+}
+
+rclone_select_remote() {
+	local conf="${1:-$(rclone_config_path)}" idx
+	RCLONE_SELECTED_REMOTE=""
+	rclone_load_remote_status "$conf" || return 1
+	read -r -p "请选择有效远程存储（0 返回）: " idx || return 1
+	idx=$(rclone_selection_index "$idx" "${#RCLONE_REMOTE_NAMES[@]}") || return 1
+	[ "${RCLONE_REMOTE_STATES[idx]}" = valid ] || { echo "该远程尚未通过验证，已取消。"; return 1; }
+	RCLONE_SELECTED_REMOTE="${RCLONE_REMOTE_NAMES[idx]}"
+}
+
+rclone_selection_index() {
+	local value="$1" count="$2"
+	[[ "$value" =~ ^[0-9]{1,8}$ ]] || return 1
+	value=$((10#$value))
+	[ "$value" -ge 1 ] && [ "$value" -le "$count" ] || return 1
+	echo "$((value - 1))"
+}
+
+rclone_directory_names() (
+	set -o pipefail
+	rclone lsjson "$1" --dirs-only --max-depth 1 --contimeout 10s --timeout 30s --retries 1 \
+		--low-level-retries 1 2>/dev/null | python3 -c '
+import json, sys
+for item in json.load(sys.stdin):
+    name = item["Name"]
+    if item.get("IsDir") and name not in ("", ".", "..") and not any(ord(c) < 32 or ord(c) == 127 or c in "/\\" for c in name):
+        print(name)
+'
+)
+
+rclone_tree_safe() {
+	local path="$1" canonical link
+	canonical=$(realpath -m -- "$path") || return 1
+	[ "$canonical" = "$path" ] && [ ! -L "$path" ] || { echo "拒绝符号链接或非规范目标: $path"; return 1; }
+	if [ -e "$path" ]; then
+		[ -d "$path" ] || return 1
+		link=$(find "$path" -type l -print -quit) || return 1
+		[ -z "$link" ] || { echo "目标含符号链接，需人工确认: $link"; return 1; }
+	fi
+}
+
+rclone_assert_inactive() {
+	local target="$1" ids data
+	command -v docker >/dev/null 2>&1 || return 0
+	ids=$(docker ps -q 2>/dev/null) || { echo "无法检查 Docker 挂载，已停止恢复。"; return 1; }
+	[ -n "$ids" ] || return 0
+	data=$(docker inspect $ids 2>/dev/null) || return 1
+	printf '%s' "$data" | python3 -c '
+import json, os, sys
+target = os.path.realpath(sys.argv[1])
+busy = []
+for container in json.load(sys.stdin):
+    for mount in container.get("Mounts", []):
+        source = os.path.realpath(mount.get("Source", "/"))
+        if os.path.commonpath([source, target]) in (source, target):
+            busy.append(container["Name"].lstrip("/"))
+if busy:
+    print("目标数据仍被容器使用: " + ", ".join(sorted(set(busy))))
+sys.exit(bool(busy))
+' "$target"
+}
+
+rclone_require_space() {
+	local dir="$1" needed="$2" free
+	[[ "$needed" =~ ^[0-9]+$ ]] || return 1
+	free=$(df -Pk -- "$dir" | awk 'NR==2 {print $4}') || return 1
+	[[ "$free" =~ ^[0-9]+$ ]] || return 1
+	python3 -c 'import sys; sys.exit(int(sys.argv[1]) * 1024 <= int(sys.argv[2]) + 4194304)' "$free" "$needed" || {
+		echo "暂存及回滚空间不足: $dir"; return 1;
+	}
+}
+
+rclone_restore_folder() (
+	umask 077
+	set -o pipefail
+	local remote="$1" root="$2" name="$3" policy="${4:-keep}" target work size existing=0 committed=0
+	rclone_restore_name_valid "$name" || return 1
+	[ "$policy" = keep ] || [ "$policy" = replace ] || return 1
+	root=$(realpath -e -- "$root") || return 1
+	target="$root/$name"
+	rclone_tree_safe "$target" && rclone_assert_inactive "$target" || return 1
+	size=$(rclone size "$remote" --json --contimeout 10s --timeout 30s --retries 1 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["bytes"])') || return 1
+	[[ "$size" =~ ^[0-9]{1,15}$ ]] || return 1
+	[ ! -d "$target" ] || existing=$(du -sb -- "$target" | awk '{print $1}') || return 1
+	rclone_require_space "$root" "$((size * 2 + existing))" || return 1
+	work=$(mktemp -d "$root/.daimon-restore.XXXXXX") || return 1
+	trap 'if [ "$committed" = 1 ]; then if [ -e "$target" ] || [ -L "$target" ] || ! mv -T -- "$work/previous" "$target"; then echo "回滚未完成，保留: $work"; exit 1; fi; fi; rm -rf -- "$work"' EXIT
+	mkdir "$work/download" "$work/result" || return 1
+	if ! rclone copy "$remote" "$work/download" --contimeout 10s --timeout 60s --retries 1 2>"$work/error" ||
+		! rclone check "$remote" "$work/download" --download --contimeout 10s --timeout 60s --retries 1 > /dev/null 2>"$work/error"; then
+		echo "下载或内容校验失败，原目录未修改。"
+		return 1
+	fi
+	rclone_tree_safe "$work/download" || return 1
+	[ ! -d "$target" ] || cp -a -- "$target/." "$work/result/" || return 1
+	if [ "$policy" = keep ]; then
+		cp -an -- "$work/download/." "$work/result/" || return 1
+	else
+		cp -a -- "$work/download/." "$work/result/" || return 1
+	fi
+	rclone_tree_safe "$target" && rclone_assert_inactive "$target" || return 1
+	if [ -e "$target" ]; then
+		mv -- "$target" "$work/previous" || return 1
+		committed=1
+	fi
+	mv -T -- "$work/result" "$target" || return 1
+	committed=0
+	echo "恢复并校验完成: $target（同名文件策略: $policy）"
+)
 
 rclone_select_remote_dir() {
 	local remote="$1"
@@ -20021,13 +20146,12 @@ rclone_select_remote_dir() {
 
 	echo "$title"
 	echo "远程路径: $remote"
-	if ! list_output=$(rclone lsd "$remote" 2>&1); then
-		echo "$list_output"
+	if ! list_output=$(rclone_directory_names "$remote"); then
 		echo -e "${gl_hong}读取远程目录失败，请检查 rclone 配置和远程路径。${gl_bai}"
 		return 1
 	fi
 
-	mapfile -t dirs < <(echo "$list_output" | rclone_lsd_names)
+	mapfile -t dirs <<< "$list_output"
 	for i in "${dirs[@]}"; do
 		rclone_restore_name_valid "$i" && valid_dirs+=("$i")
 	done
@@ -20042,12 +20166,12 @@ rclone_select_remote_dir() {
 	done
 	echo "------------------------"
 	read -e -p "请输入目录序号: " selected_idx || return 1
-	if ! [[ "$selected_idx" =~ ^[0-9]+$ ]] || [ "$selected_idx" -lt 1 ] || [ "$selected_idx" -gt "${#valid_dirs[@]}" ]; then
+	if ! selected_idx=$(rclone_selection_index "$selected_idx" "${#valid_dirs[@]}"); then
 		echo "无效编号"
 		return 1
 	fi
 
-	RCLONE_SELECTED_DIR="${valid_dirs[$((selected_idx-1))]}"
+	RCLONE_SELECTED_DIR="${valid_dirs[selected_idx]}"
 }
 
 rclone_select_remote_dirs_multi() {
@@ -20061,13 +20185,12 @@ rclone_select_remote_dirs_multi() {
 
 	echo "$title"
 	echo "远程路径: $remote"
-	if ! list_output=$(rclone lsd "$remote" 2>&1); then
-		echo "$list_output"
+	if ! list_output=$(rclone_directory_names "$remote"); then
 		echo -e "${gl_hong}读取远程目录失败，请检查 rclone 配置和远程路径。${gl_bai}"
 		return 1
 	fi
 
-	mapfile -t dirs < <(echo "$list_output" | rclone_lsd_names)
+	mapfile -t dirs <<< "$list_output"
 	for i in "${dirs[@]}"; do
 		rclone_restore_name_valid "$i" && valid_dirs+=("$i")
 	done
@@ -20092,11 +20215,10 @@ rclone_select_remote_dirs_multi() {
 	fi
 
 	for token in $selected_raw; do
-		if ! [[ "$token" =~ ^[0-9]+$ ]] || [ "$token" -lt 1 ] || [ "$token" -gt "${#valid_dirs[@]}" ]; then
+		if ! idx=$(rclone_selection_index "$token" "${#valid_dirs[@]}"); then
 			echo -e "${gl_huang}跳过无效编号: $token${gl_bai}"
 			continue
 		fi
-		idx=$((token - 1))
 		exists=0
 		for i in "${selected_dirs[@]}"; do
 			[ "$i" = "${valid_dirs[idx]}" ] && exists=1 && break
@@ -20118,10 +20240,12 @@ rclone_restore_remote_folder() {
 		return 1
 	fi
 
-	local remote_root="qq3303338052@outlook:"
+	local remote_root root="${DAIMON_RESTORE_ROOT:-/root}" policy
 	local server_dir restore_dir remote_path target_dir confirm failed
 	local restore_dirs=()
 
+	rclone_select_remote || return 1
+	remote_root="$RCLONE_SELECTED_REMOTE:"
 	rclone_select_remote_dir "$remote_root" "请选择服务器目录" || return
 	server_dir="$RCLONE_SELECTED_DIR"
 
@@ -20131,29 +20255,27 @@ rclone_restore_remote_folder() {
 	echo -e "${gl_huang}即将执行:${gl_bai}"
 	for restore_dir in "${restore_dirs[@]}"; do
 		remote_path="${remote_root}${server_dir}/${restore_dir}"
-		target_dir="/root/${restore_dir}"
-		echo "rclone copy \"$remote_path\" \"$target_dir\" --progress"
+		target_dir="$root/${restore_dir}"
+		echo "$remote_path -> $target_dir"
 	done
+	echo "仅恢复选中的子目录；不包含根层文件、未备份的隐藏配置、/data、Docker volumes 或系统 cron。"
+	echo "云文件恢复不保证原主机的 UID/GID、权限及符号链接；启动服务前必须检查数据挂载。"
+	read -r -p "同名文件处理：1 保留本机并补齐缺项，2 使用远程版本（0 返回）: " policy || return 1
+	case "$policy" in 1) policy=keep ;; 2) policy=replace ;; *) return 0 ;; esac
 	read -e -p "确认恢复以上 ${#restore_dirs[@]} 个文件夹？(y/N): " confirm || return 1
 	[ "$confirm" = "y" ] || [ "$confirm" = "Y" ] || { echo "已取消"; return; }
 
 	failed=0
 	for restore_dir in "${restore_dirs[@]}"; do
 		remote_path="${remote_root}${server_dir}/${restore_dir}"
-		target_dir="/root/${restore_dir}"
-		mkdir -p "$target_dir"
-		rclone copy "$remote_path" "$target_dir" --progress || failed=1
+		rclone_restore_folder "$remote_path" "$root" "$restore_dir" "$policy" || failed=1
 	done
+	[ "$failed" -eq 0 ] || echo "部分目录恢复失败，不能视为整机迁移完成。"
 	return "$failed"
 }
 
 rclone_remote_entry_valid() {
-	local name="$1"
-	[ -n "$name" ] && [ "$name" != "." ] && [ "$name" != ".." ] || return 1
-	case "$name" in
-		*/*|*\\*) return 1 ;;
-	esac
-	return 0
+	rclone_restore_name_valid "$1"
 }
 
 rclone_remote_lsf_entries() {
@@ -20161,103 +20283,167 @@ rclone_remote_lsf_entries() {
 }
 
 rclone_restore_remote_sites_available() {
-	local remote_backup="$1"
-	local remote_dir="$remote_backup/sites-available"
-	local list_output entry name target failed=0 restored=0 skipped=0
-	mkdir -p /etc/nginx/sites-available
-	if ! list_output=$(rclone lsf "$remote_dir" 2>/dev/null); then
-		echo -e "${gl_hong}远程缺少 sites-available: $remote_dir${gl_bai}"
-		return 1
-	fi
-	while IFS= read -r entry; do
-		[ -n "$entry" ] || continue
-		case "$entry" in */) continue ;; esac
-		name="$entry"
-		rclone_remote_entry_valid "$name" || continue
-		target="/etc/nginx/sites-available/$name"
-		if [ -e "$target" ] || [ -L "$target" ]; then
-			echo -e "${gl_huang}已存在，跳过下载: $target${gl_bai}"
-			skipped=$((skipped + 1))
-			continue
-		fi
-		echo -e "${gl_kjlan}正在下载: $remote_dir/$name${gl_bai}"
-		if rclone copyto "$remote_dir/$name" "$target" --progress; then
-			restored=$((restored + 1))
-		else
-			failed=1
-		fi
-	done < <(echo "$list_output" | rclone_remote_lsf_entries)
-	echo -e "${gl_lv}sites-available 恢复完成：新增 $restored，跳过 $skipped${gl_bai}"
-	return "$failed"
+	rclone_nginx_download_apply "$1" sites
 }
 
 rclone_rebuild_sites_enabled_links() {
-	local remote_backup="$1"
-	local names=()
-	local name src dst list_output created=0 skipped=0
-	mkdir -p /etc/nginx/sites-enabled
-	if [ -n "$remote_backup" ] && list_output=$(rclone cat "$remote_backup/enabled_sites.txt" 2>/dev/null); then
-		mapfile -t names < <(echo "$list_output" | rclone_remote_lsf_entries)
-	elif [ -n "$remote_backup" ] && list_output=$(rclone lsf "$remote_backup/sites-available" 2>/dev/null); then
-		mapfile -t names < <(echo "$list_output" | rclone_remote_lsf_entries | sed 's#/$##')
-	else
-		mapfile -t names < <(find /etc/nginx/sites-available -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | sort)
-	fi
-	for name in "${names[@]}"; do
-		rclone_remote_entry_valid "$name" || continue
-		[ "$name" = "default" ] && continue
-		src="/etc/nginx/sites-available/$name"
-		dst="/etc/nginx/sites-enabled/$name"
-		if [ -e "$dst" ] || [ -L "$dst" ]; then
-			skipped=$((skipped + 1))
-			continue
-		fi
-		ln -s "$src" "$dst" && created=$((created + 1))
-	done
-	echo -e "${gl_lv}sites-enabled 软链接处理完成：新增 $created，跳过 $skipped${gl_bai}"
+	rclone_nginx_download_apply "$1" links
 }
 
 rclone_restore_remote_domain() {
-	local remote_backup="$1"
-	local remote_dir="$remote_backup/domain"
-	local list_output entry name target failed=0 restored=0 skipped=0
-	mkdir -p /root/domain
-	if ! list_output=$(rclone lsf "$remote_dir" 2>/dev/null); then
-		echo -e "${gl_hong}远程缺少 domain: $remote_dir${gl_bai}"
-		return 1
-	fi
-	while IFS= read -r entry; do
-		[ -n "$entry" ] || continue
-		case "$entry" in */) name="${entry%/}" ;; *) continue ;; esac
-		rclone_remote_entry_valid "$name" || continue
-		target="/root/domain/$name"
-		if [ -e "$target" ] || [ -L "$target" ]; then
-			echo -e "${gl_huang}已存在，跳过下载: $target${gl_bai}"
-			skipped=$((skipped + 1))
-			continue
-		fi
-		echo -e "${gl_kjlan}正在下载: $remote_dir/$name${gl_bai}"
-		mkdir -p "$target"
-		if rclone copy "$remote_dir/$name" "$target" --progress; then
-			restored=$((restored + 1))
-		else
-			rm -rf "$target"
-			failed=1
-		fi
-	done < <(echo "$list_output" | rclone_remote_lsf_entries)
-	echo -e "${gl_lv}/root/domain 恢复完成：新增 $restored，跳过 $skipped${gl_bai}"
-	return "$failed"
+	rclone_nginx_download_apply "$1" domain
 }
 
-rclone_check_nginx_after_restore() {
-	command -v nginx >/dev/null 2>&1 || { echo -e "${gl_huang}未检测到 nginx，跳过 nginx -t。${gl_bai}"; return 0; }
-	if nginx -t; then
-		systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || true
-		echo -e "${gl_lv}nginx 配置检查通过，已重载。${gl_bai}"
-	else
-		echo -e "${gl_hong}nginx -t 检查失败，请手动检查合并后的配置。${gl_bai}"
+rclone_nginx_prepare() {
+	if ! command -v nginx >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1; then
+		command -v apt-get >/dev/null 2>&1 || return 1
+		apt-get update && apt-get install -y nginx openssl || return 1
+	fi
+	command -v nginx >/dev/null 2>&1 && command -v openssl >/dev/null 2>&1
+}
+
+rclone_nginx_allow_ports() {
+	local status
+	command -v ufw >/dev/null 2>&1 || { echo "未安装 UFW；请核对云安全组的 80/443。"; return 0; }
+	status=$(LC_ALL=C ufw status 2>/dev/null) || return 1
+	if [[ "$status" = *'Status: active'* ]]; then
+		ufw allow 80/tcp && ufw allow 443/tcp || return 1
+	elif [[ "$status" != *'Status: inactive'* ]]; then
+		echo "无法判断 UFW 状态。"
 		return 1
 	fi
+}
+
+rclone_nginx_cert_valid() (
+	set -o pipefail
+	local dir="$1" cert_key private_key
+	[ -s "$dir/fullchain.pem" ] && [ -s "$dir/privkey.pem" ] || { echo "证书或私钥缺失: $dir"; return 1; }
+	openssl x509 -in "$dir/fullchain.pem" -noout -checkend 0 >/dev/null 2>&1 || { echo "证书无效或已过期: $dir"; return 1; }
+	cert_key=$(openssl x509 -in "$dir/fullchain.pem" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum) || return 1
+	private_key=$(openssl pkey -in "$dir/privkey.pem" -passin pass: -pubout -outform DER 2>/dev/null | sha256sum) || return 1
+	[ "$cert_key" = "$private_key" ] || { echo "证书与私钥不匹配: $dir"; return 1; }
+)
+
+rclone_nginx_apply() (
+	umask 077
+	set -o pipefail
+	local backup="$1" mode="${2:-all}" policy="${3:-keep}"
+	local nginx_dir="${DAIMON_NGINX_DIR:-/etc/nginx}" domain_dir="${DAIMON_DOMAIN_DIR:-${DAIMON_RESTORE_ROOT:-/root}/domain}"
+	local work name src dst key i changed=0 was_running=0 size=0
+	local keys=() targets=() existed=()
+	case "$policy" in keep|replace) ;; *) return 1 ;; esac
+	case "$mode" in sites) keys=(sites-available) ;; links) keys=(sites-enabled) ;; domain) keys=(domain) ;; all) keys=(sites-available sites-enabled domain) ;; *) return 1 ;; esac
+	rclone_tree_safe "$backup" || return 1
+	if [ "$mode" = all ] || [ "$mode" = links ]; then
+		[ -f "$backup/enabled_sites.txt" ] || { echo "缺少 enabled_sites.txt，拒绝猜测或启用本机其他站点。"; return 1; }
+	fi
+	rclone_nginx_prepare || { echo "Nginx 依赖安装失败，未恢复配置。"; return 1; }
+	mkdir -p "$nginx_dir" "$(dirname "$domain_dir")" || return 1
+	[ "$(realpath -e "$nginx_dir")" = "$nginx_dir" ] || return 1
+	for key in "${keys[@]}"; do
+		if [ "$key" = domain ]; then dst="$domain_dir"; else dst="$nginx_dir/$key"; fi
+		[ "$(realpath -m "$dst")" = "$dst" ] && [ ! -L "$dst" ] || return 1
+		[ ! -e "$dst" ] || [ -d "$dst" ] || return 1
+		[ "$key" = sites-enabled ] || rclone_tree_safe "$dst" || return 1
+		rclone_assert_inactive "$dst" || return 1
+		targets+=("$dst")
+		[ ! -d "$dst" ] || size=$((size + $(du -sb "$dst" | awk '{print $1}')))
+	done
+	size=$((size + $(du -sb "$backup" | awk '{print $1}')))
+	rclone_require_space "$nginx_dir" "$((size * 2))" || return 1
+	work=$(mktemp -d "$nginx_dir/.daimon-nginx.XXXXXX") || return 1
+	systemctl is-active --quiet nginx && was_running=1
+	rclone_nginx_finish() {
+		local rc=$? j rollback_failed=0
+		if [ "$rc" -ne 0 ] && [ "$changed" -gt 0 ]; then
+			if [ "$was_running" = 0 ]; then systemctl stop nginx >/dev/null 2>&1 || rollback_failed=1; fi
+			for ((j=changed-1; j>=0; j--)); do
+				rm -rf -- "${targets[j]}" || rollback_failed=1
+				[ "${existed[j]}" = 0 ] || cp -a -- "$work/old/$j" "${targets[j]}" || rollback_failed=1
+			done
+			if [ "$was_running" = 1 ]; then
+				nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || rollback_failed=1
+			fi
+			echo "恢复失败，已尝试回滚原配置。"
+		fi
+		if [ "$rollback_failed" = 0 ]; then rm -rf -- "$work"; else echo "回滚未完成，保留现场: $work"; fi
+	}
+	trap rclone_nginx_finish EXIT
+	mkdir "$work/old" "$work/new" || return 1
+	for i in "${!keys[@]}"; do
+		key="${keys[i]}" dst="${targets[i]}"
+		if [ -d "$dst" ]; then
+			existed+=(1)
+			cp -a -- "$dst" "$work/old/$i" && cp -a -- "$dst" "$work/new/$key" || return 1
+		else
+			existed+=(0)
+			mkdir "$work/new/$key" || return 1
+		fi
+		[ "$key" != sites-enabled ] || continue
+		[ -d "$backup/$key" ] || { echo "备份缺少: $key"; return 1; }
+		if [ "$policy" = keep ]; then
+			cp -an -- "$backup/$key/." "$work/new/$key/" || return 1
+		else
+			cp -a -- "$backup/$key/." "$work/new/$key/" || return 1
+		fi
+	done
+	if [ "$mode" = domain ] || [ "$mode" = all ]; then
+		for src in "$backup/domain"/*; do
+			[ -d "$src" ] || continue
+			rclone_nginx_cert_valid "$work/new/domain/$(basename "$src")" || return 1
+		done
+	fi
+	if [ "$mode" = links ] || [ "$mode" = all ]; then
+		while IFS= read -r name || [ -n "$name" ]; do
+			[ -n "$name" ] || continue
+			rclone_restore_name_valid "$name" || { echo "站点清单包含非法名称。"; return 1; }
+			src="$nginx_dir/sites-available/$name"
+			if [ "$mode" = all ]; then [ -f "$work/new/sites-available/$name" ] || return 1; else [ -f "$src" ] || return 1; fi
+			dst="$work/new/sites-enabled/$name"
+			if [ -L "$dst" ] && [ "$(realpath -m "$nginx_dir/sites-enabled/$name")" = "$src" ]; then continue; fi
+			if [ -e "$dst" ] || [ -L "$dst" ]; then echo "启用站点冲突: $name"; return 1; fi
+			ln -s -- "$src" "$dst" || return 1
+		done < "$backup/enabled_sites.txt"
+	fi
+	for i in "${!keys[@]}"; do
+		changed=$((i + 1))
+		rm -rf -- "${targets[i]}" && cp -a -- "$work/new/${keys[i]}" "${targets[i]}" || return 1
+	done
+	nginx -t || { echo "配置校验失败，检查缺失的 include、证书、模块或路径。"; return 1; }
+	rclone_nginx_allow_ports && rclone_check_nginx_after_restore || return 1
+	systemctl enable nginx >/dev/null 2>&1 || return 1
+	echo "Nginx 恢复成功（同名文件策略: $policy）；未修改 DNS。"
+	[ -x "${DAIMON_RESTORE_ROOT:-/root}/.acme.sh/acme.sh" ] || echo "注意：acme.sh 未迁移，证书自动续期尚未验证。"
+	return 0
+)
+
+rclone_nginx_download_apply() (
+	umask 077
+	set -o pipefail
+	local remote="$1" mode="$2" policy="${3:-keep}" work size root="${DAIMON_RESTORE_ROOT:-/root}"
+	size=$(rclone size "$remote" --json --contimeout 10s --timeout 30s --retries 1 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["bytes"])') || return 1
+	[[ "$size" =~ ^[0-9]{1,15}$ ]] || return 1
+	rclone_require_space "$root" "$((size * 3))" || return 1
+	work=$(mktemp -d "$root/.daimon-nginx-download.XXXXXX") || return 1
+	trap 'rm -rf -- "$work"' EXIT
+	if ! rclone copy "$remote" "$work" --contimeout 10s --timeout 60s --retries 1 2>/dev/null ||
+		! rclone check "$remote" "$work" --download --contimeout 10s --timeout 60s --retries 1 >/dev/null 2>&1; then
+		echo "Nginx 备份下载或内容校验失败，未应用配置。"
+		return 1
+	fi
+	rclone_nginx_apply "$work" "$mode" "$policy"
+)
+
+rclone_check_nginx_after_restore() {
+	command -v nginx >/dev/null 2>&1 || { echo "未安装 Nginx，恢复未完成。"; return 1; }
+	nginx -t || return 1
+	if systemctl is-active --quiet nginx; then
+		systemctl reload nginx || { echo "Nginx 重载失败。"; return 1; }
+	else
+		systemctl start nginx || { echo "Nginx 启动失败。"; return 1; }
+	fi
+	systemctl is-active --quiet nginx || return 1
+	echo "Nginx 配置校验及服务状态检查通过。"
 }
 
 rclone_restore_nginx_domain_remote() {
@@ -20267,9 +20453,10 @@ rclone_restore_nginx_domain_remote() {
 		return 1
 	fi
 
-	local remote_root="qq3303338052@outlook:"
-	local server_dir remote_backup choice confirm failed
+	local remote_root server_dir remote_backup choice confirm mode policy
 
+	rclone_select_remote || return 1
+	remote_root="$RCLONE_SELECTED_REMOTE:"
 	rclone_select_remote_dir "$remote_root" "请选择包含 Nginx + 域名备份的服务器目录" || return
 	server_dir="$RCLONE_SELECTED_DIR"
 	remote_backup="${remote_root}${server_dir}/linux-daimon/backup/nginx-domain/auto_latest"
@@ -20291,29 +20478,247 @@ rclone_restore_nginx_domain_remote() {
 		echo -e "${gl_kjlan}------------------------${gl_bai}"
 		read -e -p "请输入你的选择: " choice || return 1
 		case "$choice" in
-			1)
-				rclone_restore_remote_sites_available "$remote_backup" && rclone_check_nginx_after_restore
-				;;
-			2)
-				rclone_rebuild_sites_enabled_links "$remote_backup" && rclone_check_nginx_after_restore
-				;;
-			3)
-				rclone_restore_remote_domain "$remote_backup" && rclone_check_nginx_after_restore
-				;;
-			4)
-				read -e -p "确认一键恢复 sites-available、sites-enabled 软链接和 /root/domain？同名文件保留本机现有版本。(y/N): " confirm || return 1
-				[ "$confirm" = "y" ] || [ "$confirm" = "Y" ] || { echo "已取消"; continue; }
-				failed=0
-				rclone_restore_remote_sites_available "$remote_backup" || failed=1
-				rclone_rebuild_sites_enabled_links "$remote_backup" || failed=1
-				rclone_restore_remote_domain "$remote_backup" || failed=1
-				[ "$failed" -eq 0 ] && rclone_check_nginx_after_restore
-				;;
+			1) mode=sites ;;
+			2) mode=links ;;
+			3) mode=domain ;;
+			4) mode=all ;;
 			0) return ;;
-			*) echo "无效的输入!" ;;
+			*) echo "无效的输入!"; continue ;;
 		esac
+		read -r -p "同名文件：1 保留并补齐，2 使用远程版本（0 返回）: " policy || return 1
+		case "$policy" in 1) policy=keep ;; 2) policy=replace ;; *) continue ;; esac
+		read -r -p "确认恢复并检查 Nginx、证书及 80/443？(y/N): " confirm || return 1
+		[ "$confirm" = y ] || [ "$confirm" = Y ] || continue
+		rclone_nginx_download_apply "$remote_backup" "$mode" "$policy" || echo "恢复失败，不能视为迁移完成。"
 	done
 }
+
+rclone_compose_directories() {
+	python3 - "${DAIMON_RESTORE_ROOT:-/root}" <<'PY'
+import os, sys
+root = os.path.realpath(sys.argv[1])
+names = {"compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"}
+for directory, children, files in os.walk(root, followlinks=False):
+    depth = len(os.path.relpath(directory, root).split(os.sep)) if directory != root else 0
+    children[:] = [name for name in sorted(children) if depth < 3 and not name.startswith((".", "migration-", "audit-")) and name not in ("data", "backup", "backups", "node_modules", "volumes")]
+    if names.intersection(files) and not any(ord(c) < 32 or ord(c) == 127 for c in directory):
+        print(directory)
+PY
+}
+
+rclone_compose_context() {
+	local dir="$1" data ids context line
+	RCLONE_COMPOSE_ARGS=()
+	ids=$(docker ps -aq 2>/dev/null) || return 1
+	[ -n "$ids" ] || return 0
+	data=$(docker inspect $ids 2>/dev/null) || return 1
+	context=$(printf '%s' "$data" | python3 -c '
+import json,sys
+contexts = set()
+for container in json.load(sys.stdin):
+    labels = container["Config"].get("Labels") or {}
+    if labels.get("com.docker.compose.project.working_dir") == sys.argv[1]:
+        contexts.add((labels.get("com.docker.compose.project", ""), labels.get("com.docker.compose.project.config_files", "")))
+if len(contexts) > 1:
+    sys.exit("Multiple Compose contexts share this directory; select them manually.")
+for project, files in contexts:
+    if not project or not files or any(ord(c) < 32 or ord(c) == 127 for c in project + files):
+        sys.exit(1)
+    print(project)
+    print(files.replace(",", "\n"))
+' "$dir") || return 1
+	[ -n "$context" ] || return 0
+	local -a lines=()
+	mapfile -t lines <<< "$context"
+	RCLONE_COMPOSE_ARGS=(-p "${lines[0]}")
+	for line in "${lines[@]:1}"; do
+		[ -f "$line" ] || { echo "Compose 配置缺失: $line"; return 1; }
+		RCLONE_COMPOSE_ARGS+=(-f "$line")
+	done
+}
+
+rclone_compose_run() (
+	local dir="$1"
+	shift
+	cd -- "$dir" || return 1
+	docker compose "${RCLONE_COMPOSE_ARGS[@]}" "$@"
+)
+
+rclone_compose_status() (
+	umask 077
+	local dir="$1" work
+	work=$(mktemp -d) || return 2
+	trap 'rm -rf -- "$work"' EXIT
+	rclone_compose_run "$dir" config --format json > "$work/config" 2>/dev/null &&
+		rclone_compose_run "$dir" config --services > "$work/services" 2>/dev/null &&
+		rclone_compose_run "$dir" ps -a --format json > "$work/ps" 2>/dev/null || return 2
+	python3 - "$work" <<'PY'
+import json, sys
+from pathlib import Path
+work = Path(sys.argv[1])
+try:
+    config = json.loads((work / "config").read_text())
+    active = (work / "services").read_text().splitlines()
+    raw = (work / "ps").read_text().strip()
+    containers = json.loads(raw) if raw.startswith("[") else [json.loads(line) for line in raw.splitlines()]
+    if not active:
+        sys.exit(2)
+    jobs = {name for service in config["services"].values() for name, dependency in service.get("depends_on", {}).items() if isinstance(dependency, dict) and dependency.get("condition") == "service_completed_successfully"}
+    missing = False
+    for name in active:
+        service = config["services"][name]
+        count = service.get("scale", service.get("deploy", {}).get("replicas", 1))
+        rows = [c for c in containers if c.get("Service") == name]
+        if len(rows) < count:
+            missing = True
+        for row in rows:
+            if name in jobs and row.get("State") == "exited" and row.get("ExitCode") == 0:
+                continue
+            if row.get("Health") == "unhealthy" or row.get("State") in ("dead", "restarting"):
+                sys.exit(3)
+            if row.get("State") != "running" or row.get("Health") not in ("", None, "healthy"):
+                missing = True
+    sys.exit(1 if missing else 0)
+except (ValueError, KeyError, TypeError):
+    sys.exit(2)
+PY
+)
+
+rclone_compose_preflight() (
+	umask 077
+	set -o pipefail
+	local dir="$1" phase="${2:-before}" work ids name ip port pid subnet status failed=0 confirm
+	work=$(mktemp -d) || return 1
+	trap 'rm -rf -- "$work"' EXIT
+	rclone_compose_run "$dir" config --format json > "$work/config" 2>/dev/null &&
+		rclone_compose_run "$dir" config --services > "$work/services" 2>/dev/null || { echo "Compose 配置或环境文件解析失败。"; return 1; }
+	ids=$(docker ps -aq 2>/dev/null) || return 1
+	if [ -n "$ids" ]; then docker inspect $ids > "$work/containers" 2>/dev/null || return 1; else echo '[]' > "$work/containers"; fi
+	ids=$(docker volume ls -q 2>/dev/null) || return 1
+	if [ -n "$ids" ]; then docker volume inspect $ids > "$work/volumes" 2>/dev/null || return 1; else echo '[]' > "$work/volumes"; fi
+	ids=$(docker network ls -q 2>/dev/null) || return 1
+	if [ -n "$ids" ]; then docker network inspect $ids > "$work/networks" 2>/dev/null || return 1; else echo '[]' > "$work/networks"; fi
+	if ! timeout 30s python3 - "$work" <<'PY'
+import ipaddress, json, os, re, socket, sys
+from pathlib import Path
+from urllib.parse import urlsplit
+work = Path(sys.argv[1])
+config = json.loads((work / "config").read_text())
+containers = json.loads((work / "containers").read_text())
+volumes = {v["Name"]: v for v in json.loads((work / "volumes").read_text())}
+networks = {n["Name"]: n for n in json.loads((work / "networks").read_text())}
+active = (work / "services").read_text().splitlines()
+errors, proxies, rules = [], [], set()
+project = config["name"]
+for name in active:
+    service = config["services"][name]
+    current = [c for c in containers if (c["Config"].get("Labels") or {}).get("com.docker.compose.project") == project and (c["Config"].get("Labels") or {}).get("com.docker.compose.service") == name and c["State"]["Running"]]
+    for mount in service.get("volumes", []):
+        source = mount.get("source")
+        if mount["type"] == "bind":
+            if not source or not Path(source).exists():
+                errors.append(name + ": bind source missing: " + str(source))
+            elif source not in ("/etc/localtime", "/etc/timezone", "/var/run/docker.sock"):
+                print(name + ": bind " + source + "; verify original data and UID/GID before startup")
+        elif mount["type"] == "volume":
+            volume = config.get("volumes", {}).get(source, {}).get("name", project + "_" + str(source))
+            if not source or volume not in volumes:
+                errors.append(name + ": volume missing or anonymous; restore data before startup: " + volume)
+            else:
+                print(name + ": named volume " + volume + " is outside /root restore coverage")
+    if service.get("restart", "no") not in ("always", "unless-stopped"):
+        print(name + ": restart=" + service.get("restart", "no") + "; not guaranteed to start after reboot")
+    hosts = service.get("extra_hosts", {})
+    if isinstance(hosts, list):
+        hosts = dict(re.split(r"[=:]", value, maxsplit=1) for value in hosts)
+    for key, value in service.get("environment", {}).items():
+        if key.lower() not in ("http_proxy", "https_proxy", "all_proxy") or not value:
+            continue
+        try:
+            url = urlsplit(value)
+            host, port = url.hostname, url.port or (443 if url.scheme == "https" else 80)
+            if url.scheme not in ("http", "https", "socks5", "socks5h", "socks4") or not host or not 1 <= port <= 65535:
+                raise ValueError()
+            host_ip = ipaddress.ip_address(host) if re.fullmatch(r"[0-9.]+|[0-9a-fA-F:]+", host) else None
+            if service.get("network_mode") != "host" and (host in ("localhost", "::1") or (host_ip and host_ip.is_loopback)):
+                errors.append(name + ": " + key + " points to container loopback, not the host")
+                continue
+            for container in current or [None]:
+                address = hosts.get(host, host)
+                if host == "host.docker.internal" and host not in hosts and not container:
+                    errors.append(name + ": missing extra_hosts mapping for host.docker.internal")
+                    continue
+                if container:
+                    hosts_file = Path(container.get("HostsPath", "/nonexistent"))
+                    if hosts_file.is_file():
+                        for line in hosts_file.read_text().splitlines():
+                            fields = line.split("#", 1)[0].split()
+                            if host in fields[1:]:
+                                address = fields[0]
+                if address == "host-gateway":
+                    daemon = Path("/etc/docker/daemon.json")
+                    settings = json.loads(daemon.read_text()) if daemon.is_file() else {}
+                    gateways = settings.get("host-gateway-ips", [settings.get("host-gateway-ip")])
+                    address = gateways[0] or next((c["Gateway"] for c in networks.get("bridge", {}).get("IPAM", {}).get("Config", []) if c.get("Gateway")), None)
+                if address in config["services"]:
+                    peers = [c for c in containers if (c["Config"].get("Labels") or {}).get("com.docker.compose.project") == project and (c["Config"].get("Labels") or {}).get("com.docker.compose.service") == address and c["State"]["Running"]]
+                    shared = set(container["NetworkSettings"]["Networks"]) if container else set(networks)
+                    address = next((n["IPAddress"] for c in peers for k,n in c["NetworkSettings"]["Networks"].items() if k in shared and n.get("IPAddress")), None)
+                if not address:
+                    print(name + ": proxy target requires validation after startup")
+                    continue
+                address = socket.gethostbyname(address)
+                ipaddress.ip_address(address)
+                pid = container["State"]["Pid"] if container else 0
+                proxies.append((name, address, port, pid))
+                gateways = {c.get("Gateway") for n in networks.values() for c in n.get("IPAM", {}).get("Config", [])}
+                if container and address in gateways:
+                    for network in container["NetworkSettings"]["Networks"]:
+                        for entry in networks.get(network, {}).get("IPAM", {}).get("Config", []):
+                            subnet = entry.get("Subnet")
+                            if subnet and ipaddress.ip_network(subnet).version == 4:
+                                rules.add((subnet, port))
+        except (ValueError, OSError, TypeError):
+            errors.append(name + ": " + key + " endpoint could not be validated (credentials hidden)")
+with (work / "proxies").open("w") as output:
+    for row in sorted(set(proxies)):
+        output.write("\t".join(map(str, row)) + "\n")
+with (work / "rules").open("w") as output:
+    for row in sorted(rules):
+        output.write("\t".join(map(str, row)) + "\n")
+for error in errors:
+    print("ERROR " + error)
+sys.exit(bool(errors))
+PY
+	then return 1; fi
+	while IFS=$'\t' read -r name ip port pid; do
+		[ -n "$name" ] || continue
+		if [ "$pid" -gt 0 ]; then
+			command -v nsenter >/dev/null 2>&1 || { echo "缺少 nsenter，无法验证容器网络。"; failed=1; continue; }
+			if ! nsenter -t "$pid" -n -- timeout 4 bash -c 'exec 3<>/dev/tcp/$1/$2' _ "$ip" "$port" 2>/dev/null; then
+				echo "$name: 容器无法连接代理 $ip:$port；检查监听、网关及 UFW。"
+				failed=1
+			else
+				echo "$name: 容器到代理 $ip:$port TCP 可达（未验证代理外网请求）。"
+			fi
+		else
+			echo "$name: 代理 $ip:$port，待容器启动后验证。"
+		fi
+	done < "$work/proxies"
+	if [ "$failed" = 1 ] && [ "$phase" != verify ] && [ -s "$work/rules" ] && command -v ufw >/dev/null 2>&1; then
+		status=$(LC_ALL=C ufw status 2>/dev/null) || return 1
+		if [[ "$status" = *'Status: active'* ]]; then
+			while IFS=$'\t' read -r subnet port; do echo "ufw allow from $subnet to any port $port proto tcp"; done < "$work/rules"
+			read -r -p "是否添加以上 Docker 网段到必要宿主机端口的规则？(y/N): " confirm || return 1
+			if [ "$confirm" = y ] || [ "$confirm" = Y ]; then
+				while IFS=$'\t' read -r subnet port; do ufw allow from "$subnet" to any port "$port" proto tcp || return 1; done < "$work/rules"
+				rclone_compose_preflight "$dir" verify
+				return $?
+			fi
+		fi
+	fi
+	[ "$failed" = 0 ]
+)
 
 rclone_restore_docker_compose_projects() {
 	root_use
@@ -20335,26 +20740,12 @@ rclone_restore_docker_compose_projects() {
 		return 1
 	fi
 
-	local compose_file project_dir confirm found=0
+	local project_dir confirm found=0 directories
 	local start_dirs=()
 	local success_dirs=()
 	local skipped_dirs=()
 	local failed_dirs=()
 	local check_failed_dirs=()
-
-	rclone_compose_all_services_running() {
-		local project_dir="$1"
-		local services running service
-		if ! services="$(cd "$project_dir" && docker compose config --services 2>/dev/null)"; then
-			return 2
-		fi
-		[ -n "$services" ] || return 2
-		running="$(cd "$project_dir" && docker compose ps --services --status running 2>/dev/null || true)"
-		for service in $services; do
-			echo "$running" | grep -Fxq "$service" || return 1
-		done
-		return 0
-	}
 
 	rclone_show_compose_restore_group() {
 		local title="$1"
@@ -20367,11 +20758,15 @@ rclone_restore_docker_compose_projects() {
 		printf '  %s\n' "$@"
 	}
 
-	for compose_file in /root/*/docker-compose.yml; do
-		[ -f "$compose_file" ] || continue
+	directories=$(rclone_compose_directories) || return 1
+	while IFS= read -r project_dir; do
+		[ -n "$project_dir" ] || continue
 		found=1
-		project_dir="$(dirname "$compose_file")"
-		if rclone_compose_all_services_running "$project_dir"; then
+		if ! rclone_compose_context "$project_dir" || ! rclone_compose_preflight "$project_dir" before; then
+			check_failed_dirs+=("$project_dir")
+			continue
+		fi
+		if rclone_compose_status "$project_dir"; then
 			skipped_dirs+=("$project_dir")
 		else
 			case "$?" in
@@ -20379,10 +20774,10 @@ rclone_restore_docker_compose_projects() {
 				*) check_failed_dirs+=("$project_dir") ;;
 			esac
 		fi
-	done
+	done <<< "$directories"
 
 	if [ "$found" -eq 0 ]; then
-		echo -e "${gl_huang}未发现 /root 第一层子文件夹中的 docker-compose.yml。${gl_bai}"
+		echo "未发现受限扫描范围内的 Compose 项目。"
 		return 0
 	fi
 
@@ -20406,7 +20801,9 @@ rclone_restore_docker_compose_projects() {
 
 	for project_dir in "${start_dirs[@]}"; do
 		echo -e "${gl_kjlan}正在启动: $project_dir${gl_bai}"
-		if (cd "$project_dir" && docker compose up -d); then
+		if rclone_compose_context "$project_dir" && rclone_compose_preflight "$project_dir" before &&
+			rclone_compose_run "$project_dir" up -d --no-recreate --no-build --pull missing --wait --wait-timeout 120 &&
+			rclone_compose_status "$project_dir" && rclone_compose_preflight "$project_dir" after; then
 			success_dirs+=("$project_dir")
 		else
 			failed_dirs+=("$project_dir")
@@ -20418,17 +20815,22 @@ rclone_restore_docker_compose_projects() {
 	rclone_show_compose_restore_group "已完整运行，跳过" "${skipped_dirs[@]}"
 	rclone_show_compose_restore_group "启动失败" "${failed_dirs[@]}"
 	rclone_show_compose_restore_group "检测失败" "${check_failed_dirs[@]}"
+	echo "未修改业务 YAML、Mihomo 或 DNS；无 healthcheck 的服务仅确认容器运行，登录和接口仍需验证。"
+	echo "目录恢复不会安装系统 cron；请在 Docker 自动更新管理中核对脚本和定时任务。"
 	echo -e "${gl_kjlan}------------------------${gl_bai}"
 	[ "${#failed_dirs[@]}" -eq 0 ] && [ "${#check_failed_dirs[@]}" -eq 0 ]
 }
 
 rclone_manager() {
+	local remote_status
+	remote_status=$(rclone_load_remote_status 2>/dev/null) || true
 	while true; do
 		clear
 		echo -e "rclone 配置"
 		echo -e "${gl_kjlan}------------------------${gl_bai}"
 		echo -e "当前版本: ${gl_huang}$(rclone_status_text)${gl_bai}"
-		echo -e "配置文件: ${gl_kjlan}/root/.config/rclone/rclone.conf${gl_bai}"
+		echo -e "配置文件: ${gl_kjlan}$(rclone_config_path)${gl_bai}"
+		printf '%s\n' "$remote_status"
 		echo -e "${gl_kjlan}------------------------${gl_bai}"
 		echo -e "${gl_kjlan}1.   ${gl_bai}安装 rclone（自动创建配置文件并设置权限）"
 		echo -e "${gl_kjlan}2.   ${gl_bai}修改配置文件"
@@ -20440,8 +20842,8 @@ rclone_manager() {
 		echo -e "${gl_kjlan}------------------------${gl_bai}"
 		read -e -p "请输入你的选择: " sub_choice || return 1
 		case $sub_choice in
-			1) rclone_install_tool ;;
-			2) rclone_edit_config ;;
+			1) rclone_install_tool; remote_status=$(rclone_load_remote_status 2>/dev/null) || true ;;
+			2) rclone_edit_config; remote_status=$(rclone_load_remote_status 2>/dev/null) || true ;;
 			3) rclone_uninstall_tool ;;
 			4) rclone_restore_remote_folder ;;
 			5) rclone_restore_nginx_domain_remote ;;
@@ -20455,7 +20857,48 @@ rclone_manager() {
 
 
 bitwarden_rclone_conf_file() {
-	echo "/var/lib/docker/volumes/vaultwarden-rclone-data/_data/rclone/rclone.conf"
+	local volume path
+	volume=$(bitwarden_volume_name /config "${DAIMON_VAULT_CONFIG_VOLUME:-vaultwarden-rclone-data}") || return 1
+	path=$(docker volume inspect --format '{{.Mountpoint}}' "$volume" 2>/dev/null) || return 1
+	printf '%s/rclone/rclone.conf\n' "$path"
+}
+
+bitwarden_volume_name() {
+	local destination="$1" fallback="$2" container="${DAIMON_VAULT_BACKUP_CONTAINER:-vaultwarden-backup}" data
+	if ! data=$(docker inspect "$container" 2>/dev/null); then
+		docker info >/dev/null 2>&1 || return 1
+		printf '%s\n' "$fallback"
+		return
+	fi
+	printf '%s' "$data" | python3 -c '
+import json,sys
+mounts = [m for m in json.load(sys.stdin)[0]["Mounts"] if m["Destination"].rstrip("/") == sys.argv[1]]
+if len(mounts) != 1 or mounts[0]["Type"] != "volume" or not mounts[0].get("Name"):
+    sys.exit("Vaultwarden requires the expected named volume; no Compose file was changed.")
+print(mounts[0]["Name"])
+' "$destination"
+}
+
+bitwarden_backup_image() {
+	local image
+	image=$(docker inspect --format '{{.Image}}' "${DAIMON_VAULT_BACKUP_CONTAINER:-vaultwarden-backup}" 2>/dev/null) ||
+		image=$(docker image inspect --format '{{.Id}}' ttionya/vaultwarden-backup:latest 2>/dev/null) || return 1
+	[[ "$image" = sha256:* ]] || return 1
+	printf '%s\n' "$image"
+}
+
+bitwarden_remote_path() {
+	local data
+	data=$(docker inspect "${DAIMON_VAULT_BACKUP_CONTAINER:-vaultwarden-backup}" 2>/dev/null) || return 1
+	printf '%s' "$data" | python3 -c '
+import json,sys
+env = dict(e.split("=",1) for e in json.load(sys.stdin)[0]["Config"]["Env"] if "=" in e)
+remote = env.get("RCLONE_REMOTE_NAME", "BitwardenBackup")
+path = env.get("RCLONE_REMOTE_DIR", "/BitwardenBackup/")
+if any(ord(c) < 32 or ord(c) == 127 for c in remote + path) or ":" in remote:
+    sys.exit(1)
+print(remote + ":" + path.rstrip("/"))
+'
 }
 
 bitwarden_sync_script_file() {
@@ -20467,10 +20910,10 @@ bitwarden_sync_cron_line() {
 }
 
 bitwarden_rclone_config_status() {
-	local conf_file
-	conf_file=$(bitwarden_rclone_conf_file)
-	if [ -f "$conf_file" ] && grep -q '^\[BitwardenBackup\]' "$conf_file" 2>/dev/null; then
-		echo -e "${gl_lv}已配置${gl_bai}"
+	local conf_file remote
+	if conf_file=$(bitwarden_rclone_conf_file) && [ -f "$conf_file" ]; then
+		remote=$(bitwarden_remote_path) || { rclone_state_text unknown; return; }
+		rclone_state_text "$(rclone_remote_state "$conf_file" "$remote")"
 	else
 		echo -e "${gl_hong}未配置${gl_bai}"
 	fi
@@ -20501,37 +20944,82 @@ bitwarden_check_requirements() {
 		echo -e "${gl_hong}未检测到 rclone，请先到 rclone管理 中安装 rclone。${gl_bai}"
 		missing=1
 	fi
+	command -v python3 >/dev/null 2>&1 || { echo "需要 python3 验证配置及恢复数据。"; missing=1; }
+	docker info >/dev/null 2>&1 || { echo "Docker daemon 不可用。"; missing=1; }
 	return "$missing"
 }
 
 bitwarden_configure_rclone_conf() (
 	root_use
 	bitwarden_check_requirements || return 1
-
-	local target_dir="/var/lib/docker/volumes/vaultwarden-rclone-data/_data/rclone"
-	local work staged=""
+	umask 077
+	local conf source_conf volume mount target image work staged="" existed=0
+	source_conf=$(rclone_config_path)
+	rclone_select_remote "$source_conf" || return 1
+	image=$(bitwarden_backup_image) || { echo "未找到本机备份镜像，未下载或升级镜像。"; return 1; }
+	volume=$(bitwarden_volume_name /config "${DAIMON_VAULT_CONFIG_VOLUME:-vaultwarden-rclone-data}") || return 1
 	work=$(mktemp -d) || return 1
-	trap 'rm -rf -- "$work"; [ -z "$staged" ] || rm -f -- "$staged"' EXIT
-
-	echo "正在复制 rclone.conf..."
-	if ! rclone copy "qq3303338052@outlook:/rclone.conf" "$work/"; then
-		echo -e "${gl_hong}rclone.conf 复制失败，请检查 rclone 远程配置 qq3303338052@outlook 是否可用。${gl_bai}"
+	trap 'if [ -s "$work/cid" ]; then docker rm -f "$(<"$work/cid")" >/dev/null 2>&1 || true; fi; rm -rf -- "$work"; [ -z "$staged" ] || rm -f -- "$staged"' EXIT
+	if conf=$(bitwarden_rclone_conf_file) && [ -f "$conf" ]; then
+		cp -- "$conf" "$work/original.conf" || return 1
+		existed=1
+	else
+		: > "$work/original.conf"
+	fi
+	rclone --config "$source_conf" config dump --ask-password=false > "$work/source.json" 2>/dev/null || return 1
+	python3 - "$work/source.json" "$work/original.conf" "$work/rclone.conf" "$RCLONE_SELECTED_REMOTE" <<'PY' || return 1
+import configparser, json, sys
+from pathlib import Path
+source = json.loads(Path(sys.argv[1]).read_text())
+target = configparser.RawConfigParser()
+target.optionxform = str
+try:
+    target.read(sys.argv[2])
+except configparser.Error:
+    sys.exit("Existing configuration cannot be parsed; contents are hidden and unchanged.")
+selected = sys.argv[4]
+pending, visited = [selected], set()
+while pending:
+    name = pending.pop()
+    if name in visited:
+        continue
+    visited.add(name)
+    config = source[name]
+    for key in ("remote", "upstreams"):
+        for item in config.get(key, "").split():
+            dependency = item.split(":", 1)[0]
+            if ":" in item and dependency in source:
+                pending.append(dependency)
+for name in visited - {selected}:
+    if name == "BitwardenBackup" or (target.has_section(name) and dict(target[name]) != source[name]):
+        sys.exit("Remote dependency conflicts with existing configuration; nothing was replaced.")
+    target[name] = source[name]
+target["BitwardenBackup"] = source[selected]
+with open(sys.argv[3], "w") as output:
+    target.write(output)
+PY
+	echo "使用备份镜像的 rclone 直接验证候选配置..."
+	if ! timeout 30s docker run --rm --pull never --entrypoint rclone --cidfile "$work/cid" \
+		--mount "type=bind,source=$work,target=/audit" "$image" --config /audit/rclone.conf \
+		lsf BitwardenBackup: --dirs-only --max-depth 1 --ask-password=false \
+		--contimeout 8s --timeout 15s --retries 1 --low-level-retries 1 >/dev/null 2>&1; then
+		echo "BitwardenBackup 验证失败，原配置保持不变。"
 		return 1
 	fi
-	chmod 600 "$work/rclone.conf" || return 1
-	echo "正在验证 BitwardenBackup 远程存储..."
-	if ! docker run --rm \
-		--mount "type=bind,source=$work/rclone.conf,target=/audit-rclone.conf,readonly" \
-		ttionya/vaultwarden-backup:latest rclone --config /audit-rclone.conf \
-		lsd BitwardenBackup: --contimeout 10s --timeout 30s --retries 1 --low-level-retries 1 >/dev/null 2>&1; then
-		echo -e "${gl_hong}BitwardenBackup 连接验证失败，原配置保持不变。${gl_bai}"
-		return 1
+	docker volume inspect "$volume" >/dev/null 2>&1 || docker volume create "$volume" >/dev/null || return 1
+	mount=$(docker volume inspect --format '{{.Mountpoint}}' "$volume" 2>/dev/null) || return 1
+	target="$mount/rclone/rclone.conf"
+	rclone_tree_safe "$mount/rclone" || return 1
+	mkdir -p "$mount/rclone" && chmod 700 "$mount/rclone" || return 1
+	if [ "$existed" = 1 ]; then
+		cmp -s -- "$work/original.conf" "$target" || { echo "原配置已被其他进程更新，请重新操作。"; return 1; }
+	else
+		[ ! -e "$target" ] || { echo "目标配置已创建，未覆盖。"; return 1; }
 	fi
-	mkdir -p "$target_dir" || return 1
-	staged=$(mktemp "$target_dir/.rclone.conf.XXXXXX") || return 1
-	command install -m 600 "$work/rclone.conf" "$staged" && mv -f -- "$staged" "$target_dir/rclone.conf" || return 1
+	staged=$(mktemp "$mount/rclone/.rclone.conf.XXXXXX") || return 1
+	command install -m 600 "$work/rclone.conf" "$staged" && mv -f -- "$staged" "$target" || return 1
 	staged=""
-	echo -e "${gl_lv}BitwardenBackup 连接验证成功，配置已更新。${gl_bai}"
+	echo "BitwardenBackup 配置已验证并更新，其他 remote 保留；未执行生产备份。"
 )
 
 bitwarden_backup_data() {
@@ -20563,61 +21051,173 @@ bitwarden_backup_data() {
 	fi
 }
 
-bitwarden_restore_data() {
-	root_use
-	bitwarden_check_requirements || return
-
-	local remote="qq3303338052@outlook:/BitwardenBackup"
-	local list_output files selected_idx selected_file restore_dir confirm
-
-	echo "正在读取 Bitwarden 备份列表..."
-	if ! list_output=$(rclone ls "$remote" 2>&1); then
-		echo "$list_output"
-		echo -e "${gl_hong}读取备份列表失败，请检查 rclone 远程存储。${gl_bai}"
-		return 1
-	fi
-
-	mapfile -t files < <(echo "$list_output" | awk '{print $2}' | grep -E '^backup\.[0-9]{8}\.zip$' | sort -r)
-	if [ "${#files[@]}" -eq 0 ]; then
-		echo -e "${gl_hong}没有找到 backup.YYYYMMDD.zip 格式的备份文件。${gl_bai}"
-		return 1
-	fi
-
-	echo "可还原备份（按日期倒序，最新在最前面）："
-	echo "------------------------"
-	local i size
-	for ((i=0; i<${#files[@]}; i++)); do
-		size=$(echo "$list_output" | awk -v f="${files[i]}" '$2 == f {print $1; exit}')
-		printf "%2d. %-28s %s bytes\n" "$((i+1))" "${files[i]}" "$size"
-	done
-	echo "------------------------"
-	read -e -i "1" -p "请选择要还原的备份编号（默认 1 最新）: " selected_idx || return 1
-	selected_idx="${selected_idx:-1}"
-	if ! [[ "$selected_idx" =~ ^[0-9]+$ ]] || [ "$selected_idx" -lt 1 ] || [ "$selected_idx" -gt "${#files[@]}" ]; then
-		echo "无效编号"
-		return 1
-	fi
-
-	selected_file="${files[$((selected_idx-1))]}"
-	echo -e "${gl_huang}即将还原: $selected_file${gl_bai}"
-	read -e -p "还原会覆盖 vaultwarden-data 数据，确认继续？(y/N): " confirm || return 1
-	[ "$confirm" = "y" ] || [ "$confirm" = "Y" ] || { echo "已取消"; return; }
-
-	restore_dir="$(pwd)"
-	if [ ! -f "$restore_dir/$selected_file" ]; then
-		echo "当前目录未找到 $selected_file，正在从远程下载到: $restore_dir"
-		if ! rclone copy "$remote/$selected_file" "$restore_dir/"; then
-			echo -e "${gl_hong}下载备份文件失败，已停止还原。${gl_bai}"
-			return 1
-		fi
-	fi
-	echo "执行还原命令，当前目录将挂载到 /bitwarden/restore/: $restore_dir"
-	docker run --rm -it \
-		--mount type=volume,source=vaultwarden-data,target=/bitwarden/data/ \
-		--mount type=bind,source="$restore_dir",target=/bitwarden/restore/ \
-		ttionya/vaultwarden-backup:latest restore \
-		--zip-file "$selected_file"
+bitwarden_restore_preflight() {
+	local volume data
+	volume=$(bitwarden_volume_name /bitwarden/data "${DAIMON_VAULT_DATA_VOLUME:-vaultwarden-data}") || return 1
+	data=$(docker volume inspect "$volume" 2>/dev/null) || { echo "目标 named volume 不存在，请先创建并确认目标卷。"; return 1; }
+	BITWARDEN_DATA_PATH=$(printf '%s' "$data" | python3 -c '
+import json,sys
+volume = json.load(sys.stdin)[0]
+if volume["Driver"] != "local" or volume.get("Options"):
+    sys.exit("Only ordinary local named volumes are supported by this restore.")
+print(volume["Mountpoint"])
+') || return 1
+	[ -d "$BITWARDEN_DATA_PATH" ] && rclone_tree_safe "$BITWARDEN_DATA_PATH" || return 1
+	rclone_assert_inactive "$BITWARDEN_DATA_PATH" || { echo "请先停止使用此卷的 Vaultwarden 和 backup 容器，再执行还原。"; return 1; }
+	if mountpoint -q "$BITWARDEN_DATA_PATH"; then echo "目标卷仍是活动挂载点，已停止还原。"; return 1; fi
 }
+
+bitwarden_prepare_restored_files() {
+	python3 - "$1" "$2" "$3" <<'PY'
+import json, os, shutil, sqlite3, sys, tarfile
+from pathlib import Path, PurePosixPath
+source, target, previous = map(Path, sys.argv[1:])
+target.mkdir()
+for entry in source.rglob("*"):
+    if entry.is_symlink() or (not entry.is_file() and not entry.is_dir()):
+        sys.exit("Unsafe extracted archive entry.")
+databases = list(source.glob("db.*.*"))
+if len(databases) != 1:
+    sys.exit("Expected exactly one SQLite database; external databases require their native restore tools.")
+db = databases[0]
+with sqlite3.connect(db.resolve().as_uri() + "?mode=ro&immutable=1", uri=True) as conn:
+    if conn.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+        sys.exit("SQLite integrity check failed.")
+    counts = [conn.execute("SELECT COUNT(*) FROM " + table).fetchone()[0] for table in ("users", "ciphers")]
+shutil.copy2(db, target / "db.sqlite3")
+configs = list(source.glob("config.*.json"))
+if len(configs) > 1:
+    sys.exit("Ambiguous configuration in archive.")
+if configs:
+    json.loads(configs[0].read_text())
+    shutil.copy2(configs[0], target / "config.json")
+for kind in ("rsakey", "attachments", "sends"):
+    archives = list(source.glob(kind + ".*.tar"))
+    if len(archives) > 1 or (kind == "rsakey" and not archives):
+        sys.exit("Missing or ambiguous " + kind + " archive.")
+    if not archives:
+        continue
+    with tarfile.open(archives[0]) as archive:
+        members = archive.getmembers()
+        for member in members:
+            path = PurePosixPath(member.name)
+            if path.is_absolute() or ".." in path.parts or "\\" in member.name or not (member.isfile() or member.isdir()):
+                sys.exit("Unsafe tar member; target volume is unchanged.")
+            if not path.parts:
+                continue
+            if kind == "rsakey":
+                if len(path.parts) != 1 or not path.name.startswith("rsa_key"):
+                    sys.exit("Unexpected RSA key path.")
+                relative = Path(path.name)
+            else:
+                if len(path.parts) < 2 and member.isfile():
+                    sys.exit("Unexpected archive root.")
+                relative = Path(kind, *path.parts[1:])
+            destination = target / relative
+            if member.isdir():
+                destination.mkdir(parents=True, exist_ok=True)
+            else:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                with archive.extractfile(member) as incoming, destination.open("xb") as output:
+                    shutil.copyfileobj(incoming, output)
+                os.chmod(destination, member.mode & 0o777)
+    if kind == "rsakey" and not any(target.glob("rsa_key*")):
+        sys.exit("RSA key archive is empty.")
+owner = (previous / "db.sqlite3") if (previous / "db.sqlite3").exists() else previous
+if hasattr(os, "chown"):
+    stat = owner.stat()
+    for entry in [target, *target.rglob("*")]:
+        os.chown(entry, stat.st_uid, stat.st_gid)
+print("SQLite integrity OK; users=%d ciphers=%d" % tuple(counts))
+PY
+}
+
+bitwarden_restore_data() (
+	root_use
+	bitwarden_check_requirements && bitwarden_restore_preflight || return 1
+	umask 077
+	set -o pipefail
+	local remote conf image work stage="" target="$BITWARDEN_DATA_PATH" moved=0
+	local list_output selected_idx selected_file password confirm i cid bytes
+	local files=()
+	image=$(bitwarden_backup_image) || { echo "本机缺少备份工具镜像，未拉取或升级镜像。"; return 1; }
+	remote=$(bitwarden_remote_path) || return 1
+	conf=$(bitwarden_rclone_conf_file) || return 1
+	if [ "$(rclone_remote_state "$conf" "$remote")" != valid ]; then
+		echo "当前备份 remote 不可用，请选择已验证的凭据。"
+		rclone_select_remote || return 1
+		remote="$RCLONE_SELECTED_REMOTE:${remote#*:}"
+		conf=$(rclone_config_path)
+	fi
+	work=$(mktemp -d "${DAIMON_RESTORE_ROOT:-/root}/.daimon-vault-download.XXXXXX") || return 1
+	bitwarden_restore_finish() {
+		local rc=$?
+		if [ -s "$work/cid" ]; then read -r cid < "$work/cid"; docker rm -f "$cid" >/dev/null 2>&1 || true; fi
+		if [ "$moved" = 1 ]; then
+			if [ -e "$target" ] || [ -L "$target" ] || ! mv -T -- "$stage/previous" "$target"; then
+				echo "还原未完成，保留回滚目录: $stage"
+				return
+			fi
+		fi
+		[ -z "$stage" ] || rm -rf -- "$stage"
+		rm -rf -- "$work"
+		return "$rc"
+	}
+	trap bitwarden_restore_finish EXIT
+	cp -- "$conf" "$work/rclone.conf" || return 1
+	conf="$work/rclone.conf"
+	echo "备份来源: $remote"
+	list_output=$(rclone --config "$conf" lsjson "$remote" --files-only --max-depth 1 --contimeout 10s --timeout 30s --retries 1 2>/dev/null | python3 -c '
+import json,re,sys
+for entry in sorted(json.load(sys.stdin), key=lambda e:e["Name"], reverse=True):
+    if re.fullmatch(r"backup\.[0-9]{8}\.zip", entry["Name"]):
+        print(entry["Name"])
+') || { echo "读取备份列表失败。"; return 1; }
+	[ -n "$list_output" ] || { echo "未找到备份 ZIP。"; return 1; }
+	mapfile -t files <<< "$list_output"
+	for i in "${!files[@]}"; do printf '%2d. %s\n' "$((i+1))" "${files[i]}"; done
+	read -r -p "请选择备份（默认 1 最新，0 返回）: " selected_idx || return 1
+	selected_idx=$(rclone_selection_index "${selected_idx:-1}" "${#files[@]}") || return 1
+	selected_file="${files[selected_idx]}"
+	bytes=$(rclone --config "$conf" size "$remote/$selected_file" --json --contimeout 10s --timeout 30s --retries 1 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["bytes"])') || return 1
+	rclone_require_space "${DAIMON_RESTORE_ROOT:-/root}" "$bytes" || return 1
+	mkdir "$work/zip" "$work/extracted" || return 1
+	if ! rclone --config "$conf" copyto "$remote/$selected_file" "$work/zip/$selected_file" --contimeout 10s --timeout 60s --retries 1 2>/dev/null ||
+		! rclone --config "$conf" check "$remote" "$work/zip" --include "/$selected_file" --download --one-way --contimeout 10s --timeout 60s --retries 1 >/dev/null 2>&1; then
+		 echo "备份下载或内容校验失败，未修改数据卷。"; return 1
+	fi
+	bytes=$(python3 - "$work/zip/$selected_file" <<'PY'
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as archive:
+    print(sum(entry.file_size for entry in archive.infolist()) * 3)
+PY
+	) || return 1
+	rclone_require_space "${DAIMON_RESTORE_ROOT:-/root}" "$bytes" || return 1
+	read -r -s -p "请输入备份 ZIP 密码（不会显示或保存）: " password || return 1
+	echo
+	if ! printf '%s\n' "$password" | timeout 120s docker run --rm -i --pull never --network none \
+		--read-only --cap-drop ALL --security-opt no-new-privileges:true --cidfile "$work/cid" \
+		--entrypoint sh --mount "type=bind,source=$work/zip,target=/input,readonly" \
+		--mount "type=bind,source=$work/extracted,target=/output" "$image" -c \
+		'IFS= read -r password; exec 7z e -y "-p$password" "/input/$1" -o/output </dev/null' sh "$selected_file" >/dev/null 2>&1; then
+		unset password
+		echo "ZIP 解密失败或超时，未修改数据卷。"; return 1
+	fi
+	unset password
+	bitwarden_prepare_restored_files "$work/extracted" "$work/data" "$target" || return 1
+	rclone_require_space "$(dirname "$target")" "$(du -sb "$work/data" | awk '{print $1}')" || return 1
+	read -r -p "确认用已验证的备份替换 $target？容器将保持停止。(y/N): " confirm || return 1
+	[ "$confirm" = y ] || [ "$confirm" = Y ] || return 0
+	bitwarden_restore_preflight && [ "$target" = "$BITWARDEN_DATA_PATH" ] || return 1
+	stage=$(mktemp -d "$(dirname "$target")/.daimon-vault-restore.XXXXXX") || return 1
+	cp -a -- "$work/data" "$stage/new" || return 1
+	rclone check "$work/data" "$stage/new" --download >/dev/null 2>&1 || return 1
+	mv -- "$target" "$stage/previous" || return 1
+	moved=1
+	mv -T -- "$stage/new" "$target" || return 1
+	moved=0
+	echo "Vaultwarden 数据卷还原完成；请启动对应 Compose 项目并验证登录。"
+)
 
 bitwarden_configure_sync_script() {
 	root_use
@@ -20631,42 +21231,12 @@ bitwarden_configure_sync_script() {
 		return 1
 	fi
 
-	local script_dir="$DAIMON_BACKUP_SH_DIR"
 	local script_file cron_line
 	script_file=$(bitwarden_sync_script_file)
 	cron_line=$(bitwarden_sync_cron_line)
 
-	mkdir -p "$script_dir" /var/log/rclone
-	cat > "$script_file" <<'EOF'
-#!/bin/bash
-
-# ========= 源与目标 =========
-SRC_REMOTE="qq3303338052@outlook:/BitwardenBackup"
-DEST_REMOTE="kissska1:/BitwardenBackup"
-
-# ========= 日志 =========
-LOG_DIR="/var/log/rclone"
-LOG_FILE="$LOG_DIR/vaultwarden_backup_sync_$(date +%F).log"
-
-mkdir -p "$LOG_DIR"
-
-echo "===== $(date) 开始同步 Vaultwarden 备份（sync） =====" >> "$LOG_FILE"
-
-# ========= rclone sync =========
-rclone sync \
-  "$SRC_REMOTE" "$DEST_REMOTE" \
-  --transfers=4 \
-  --checkers=8 \
-  --fast-list \
-  --progress \
-  --log-file="$LOG_FILE" \
-  --log-level INFO
-
-echo "===== $(date) Vaultwarden 备份同步完成（sync） =====" >> "$LOG_FILE"
-EOF
-	chmod +x "$script_file"
-
-    (crontab -l 2>/dev/null | grep -vF "$script_file" || true; echo "$cron_line") | crontab -
+	crontab_sync_write_script bitwarden "$script_file" || return 1
+	(crontab -l 2>/dev/null | grep -vF "$script_file" || true; echo "$cron_line") | crontab - || return 1
 
 	echo -e "${gl_lv}Bitwarden 同步脚本已配置${gl_bai}"
 	echo "脚本路径: $script_file"
@@ -20854,14 +21424,18 @@ crontab_sync_custom_files() {
 		-printf '%f\n' 2>/dev/null | sort
 }
 
-crontab_sync_write_script() {
+crontab_sync_write_script() (
+	umask 077
 	local id="$1"
-	local script_file="$2"
-	mkdir -p "$(dirname "$script_file")" "$(crontab_sync_log_dir)"
+	local target="$2" script_file
+	mkdir -p "$(dirname "$target")" "$(crontab_sync_log_dir)" || return 1
+	script_file=$(mktemp "${target}.XXXXXX") || return 1
+	trap 'rm -f -- "$script_file"' EXIT
 	case "$id" in
 		bitwarden)
 			cat > "$script_file" <<'EOF'
 #!/bin/bash
+set -euo pipefail
 
 # ========= 源与目标 =========
 SRC_REMOTE="qq3303338052@outlook:/BitwardenBackup"
@@ -20891,6 +21465,7 @@ EOF
 		imagebed)
 			cat > "$script_file" <<'EOF'
 #!/bin/bash
+set -euo pipefail
 
 LOG_DIR="/var/log/rclone"
 LOG_FILE="$LOG_DIR/r2_to_onedrive_imagebed.log"
@@ -20911,6 +21486,7 @@ EOF
 		via)
 			cat > "$script_file" <<'EOF'
 #!/bin/bash
+set -euo pipefail
 
 LOG_DIR="/var/log/rclone"
 LOG_FILE="$LOG_DIR/outlook_to_kissska1_via.log"
@@ -20981,6 +21557,7 @@ EOF
 		custom)
 			cat > "$script_file" <<'EOF'
 #!/bin/bash
+set -euo pipefail
 SRC1="/root"
 # 自动获取脚本文件名（不含.sh后缀）作为目标文件夹名
 
@@ -21022,9 +21599,10 @@ rclone sync \
 echo "===== $(date) 备份完成 =====" >> "$LOG_FILE"
 EOF
 			;;
-	esac
-	chmod +x "$script_file"
-}
+		*) return 1 ;;
+	esac || return 1
+	bash -n "$script_file" && chmod 700 "$script_file" && mv -f -- "$script_file" "$target"
+)
 
 crontab_sync_reconcile_legacy() {
 	[ "${CRONTAB_SYNC_RECONCILED:-false}" = "true" ] && return 0
@@ -21126,9 +21704,9 @@ crontab_sync_install_one() {
 			;;
 	esac
 	check_crontab_installed
-	crontab_sync_write_script "$id" "$script_file"
-	(crontab -l 2>/dev/null | grep -vF "$script_file"; echo "$cron_line") | crontab -
-	[ "$id" = "nginxdomain" ] && /bin/bash "$script_file" >/dev/null 2>&1 || true
+	crontab_sync_write_script "$id" "$script_file" || return 1
+	(crontab -l 2>/dev/null | grep -vF "$script_file" || true; echo "$cron_line") | crontab - || return 1
+	if [ "$id" = "nginxdomain" ]; then /bin/bash "$script_file" || return 1; fi
 	echo -e "${gl_lv}已安装: $(basename "$script_file")${gl_bai}"
 	echo "定时任务: $cron_line"
 }

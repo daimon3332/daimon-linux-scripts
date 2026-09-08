@@ -286,21 +286,27 @@ Compose 自动更新不会预先执行 `docker compose down`。每个任务使�
 | 1 | 安装 rclone | 安装 rclone |
 | 2 | 修改配置文件 | 打开 rclone 配置 |
 | 3 | 卸载 rclone | 卸载 rclone |
-| 4 | 恢复远程文件夹到 /root | 一级服务器目录单选，二级子文件夹支持多选，恢复到 `/root/子文件夹名` |
-| 5 | 从远程恢复 Nginx + 域名 | 选择服务器目录后，恢复 `sites-available`、重建 `sites-enabled` 软链接并恢复 `/root/domain`；同名文件保留本机版本 |
-| 6 | Docker Compose 恢复 | 扫描 `/root/*/docker-compose.yml`，确认后启动未完整运行的 Compose 项目，已完整运行则跳过 |
+| 4 | 恢复远程文件夹到 /root | 选择有效 remote、服务器和子目录；暂存、内容校验后合并，拒绝活跃挂载和符号链接，明确选择同名文件策略 |
+| 5 | 从远程恢复 Nginx + 域名 | 补齐安装、站点与证书，按清单建链接并验证密钥配对、有效期和服务状态；失败回滚，不切换 DNS |
+| 6 | Docker Compose 恢复 | 受限扫描常见 Compose 文件名，复用现有项目参数；检查挂载和代理，确认后启动并等待健康，不重建已运行容器 |
+
+进入管理菜单会在隔离配置副本中实际检测每个 remote，显示名称、类型及有效／认证无效／无法检测；不打印 token，读取成功不等于已验证备份可写。需要 Python 3，单个 remote 检测最多 25 秒。
+
+迁移顺序：用户安装 Mihomo；脚本恢复目录与 Nginx/证书、检查数据挂载并启动 Compose；用户切换 DNS，再验证域名和登录。目录恢复不包含根层文件、未备份的隐藏配置、`/data`、named volumes 或系统 cron，也不保证云文件保留原 UID/GID。缺项必须先补齐，不能将容器运行视为整机恢复完成。Nginx 恢复仅在已启用的 UFW 中开放 80/443；代理受阻时可确认按实际 Docker 网段和必要端口添加规则，不全网段全端口放行。
 
 ### Bitwarden管理
 
 | 序号 | 选项 | 作用 |
 |---:|---|---|
-| 1 | 配置 rclone.conf 文件 | 暂存下载，通过容器实际连接 `BitwardenBackup:`；成功后原子更新配置，失败保留原配置，不打印 token |
+| 1 | 配置 rclone.conf 文件 | 选择有效 remote，通过本机备份镜像的 rclone 直接验证，仅替换 `BitwardenBackup` 和必要依赖；保留其他 remote，不打印 token |
 | 2 | 数据备份 | 对运行中的 `vaultwarden-backup` 容器执行 `/app/backup.sh`；退出码和上传成功字段必须同时满足 |
-| 3 | 数据还原 | 展示 `qq3303338052@outlook:/BitwardenBackup` 下的备份文件，按日期倒序选择后执行 restore |
+| 3 | 数据还原 | 读取实际 remote 和数据卷，要求使用者已停止；重新下载并校验 ZIP，隔离解密，验证 SQLite 和归档路径后替换 named volume 数据 |
 | 4 | 配置 Bitwarden 同步脚本 | 写入 `/root/linux-daimon/backup-sh/Vaultwarden_OneDrive_to_Kissska1.sh`，并添加每天 06:00 同步到 `kissska1` 的 crontab |
 | 0 | 返回主菜单 | 返回上一级菜单 |
 
 ### crontab同步脚本管理
+
+同步脚本采用原子写入并传播 rclone 失败。已生成的旧脚本需通过原菜单重新配置才会更新；更新主脚本不会立即运行生产备份或云端同步。
 
 内置脚本编号：
 

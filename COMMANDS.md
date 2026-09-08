@@ -1561,7 +1561,7 @@ bash /root/linux-daimon/daimon/warp-menu.sh u
 rclone --version
 ls -l /root/.config/rclone/rclone.conf
 ```
-解释：显示 rclone 版本和配置文件路径；未安装时显示未安装。
+解释：显示版本、配置路径及各 remote 的名称、类型、读取验证状态。使用隔离配置副本测试正常 OAuth 刷新，区分认证失败与网络／权限不确定，不输出凭据。每个 remote 检测最多 25 秒；需要 Python 3。
 
 安装 rclone：
 
@@ -1591,44 +1591,25 @@ rm -f /usr/bin/rclone /usr/local/bin/rclone
 恢复远程文件夹到 `/root`：
 
 ```bash
-rclone lsd "qq3303338052@outlook:"
-rclone lsd "qq3303338052@outlook:HuaWeiYun-HK-1C4G10M"
-mkdir -p /root/outlook
-rclone copy "qq3303338052@outlook:HuaWeiYun-HK-1C4G10M/outlook" /root/outlook --progress
-mkdir -p /root/grok2api
-rclone copy "qq3303338052@outlook:HuaWeiYun-HK-1C4G10M/grok2api" /root/grok2api --progress
+rclone_restore_remote_folder
 ```
-解释：先单选 `qq3303338052@outlook:` 下的服务器目录，再多选该目录下要恢复的子文件夹；二级目录支持输入 `1 2 3`、`1,2,3` 或 `all`，目标目录固定为 `/root/子文件夹名`。
+解释：先选择通过验证的 remote 和服务器，再多选子目录，支持 `1 2 3`、`1,2,3`、`all` 及十进制 `08`。目录名使用 JSON 解析，保留连续空格。检查真实目标路径、Docker 活跃挂载和暂存空间；下载到独立目录并通过 `rclone check --download` 比较内容，再按用户选择保留或覆盖同名文件，替换失败回滚。根层文件、隐藏配置缺项、外部 binds、volumes、系统 cron 以及原 UID/GID 需单独核对。
 
 Docker Compose 恢复：
 
 ```bash
-for compose_file in /root/*/docker-compose.yml; do
-  project_dir=$(dirname "$compose_file")
-  services=$(cd "$project_dir" && docker compose config --services)
-  running=$(cd "$project_dir" && docker compose ps --services --status running)
-  all_running=1
-  for service in $services; do
-    printf '%s\n' "$running" | grep -Fxq "$service" || all_running=0
-  done
-  [ "$all_running" -eq 1 ] && continue
-  cd "$project_dir" && docker compose up -d
-done
+rclone_restore_docker_compose_projects
+# Approved project startup uses:
+docker compose up -d --no-recreate --no-build --pull missing --wait --wait-timeout 120
 ```
-解释：扫描 `/root` 第一层子文件夹，只有存在 `docker-compose.yml` 的目录才处理；会先尝试启动 Docker daemon，再判断 Compose 配置里的服务是否全部处于 running 状态。全部运行则跳过，未完整运行则先展示待启动目录并等待确认，确认后执行 `docker compose up -d`，最后汇总启动成功、已跳过、启动失败和检测失败的目录。
+解释：扫描 `/root` 及最多三级子目录的 `compose.yaml`、`compose.yml`、`docker-compose.yaml`、`docker-compose.yml`，排除隐藏、数据、备份和审计目录。现有项目从容器 labels 复用名称及多配置文件参数；歧义或文件缺失时停止。缺少 bind source、named volume 或代理错误会阻止启动；不会静默创建空数据卷。状态查询失败不会变成启动操作，已运行但 unhealthy 的服务单独报错；有效的已完成初始化依赖不要求持续运行。启动有 120 秒健康等待，无 healthcheck 只能确认运行状态。代理通过实际容器网络命名空间验证 TCP，不打印 URL 凭据；必要 UFW 规则按实际网段和端口单独确认。不会修改业务 YAML、安装 Mihomo、切换 DNS 或自动安装迁移来的 cron。
 
 从远程恢复 Nginx + 域名：
 
 ```bash
-rclone lsd "qq3303338052@outlook:"
-rclone lsf "qq3303338052@outlook:HuaWeiYun-HK-1C4G10M/linux-daimon/backup/nginx-domain/auto_latest"
-rclone lsf "qq3303338052@outlook:HuaWeiYun-HK-1C4G10M/linux-daimon/backup/nginx-domain/auto_latest/sites-available"
-rclone copyto "qq3303338052@outlook:HuaWeiYun-HK-1C4G10M/linux-daimon/backup/nginx-domain/auto_latest/sites-available/配置名" "/etc/nginx/sites-available/配置名" --progress
-ln -s /etc/nginx/sites-available/配置名 /etc/nginx/sites-enabled/配置名
-rclone copy "qq3303338052@outlook:HuaWeiYun-HK-1C4G10M/linux-daimon/backup/nginx-domain/auto_latest/domain/example" "/root/domain/example" --progress
-nginx -t && systemctl reload nginx
+rclone_restore_nginx_domain_remote
 ```
-解释：选择服务器目录后，脚本从 `linux-daimon/backup/nginx-domain/auto_latest` 读取备份，只恢复本机缺失的 `sites-available` 配置和 `/root/domain` 证书目录，再重建 `sites-enabled` 软链接；同名文件保留本机现有版本，不会下载已存在的同名项。
+解释：从所选 remote 的服务器目录读取 `linux-daimon/backup/nginx-domain/auto_latest`，下载和内容验证后才应用。支持保留或替换同名文件，已有证书目录也会补齐缺失文件，并检查有效期和私钥配对。没有 `enabled_sites.txt` 时拒绝猜测启用列表。缺少 include、模块或其他文件会在 `nginx -t` 阶段失败并回滚，失败不会覆盖源备份；本地恢复共用同一逻辑。Nginx/openssl 缺失时通过 apt 安装；UFW 已启用才开放 80/443，不强制启用 UFW。服务启动、重载、状态或自启配置失败均报告失败。证书续期环境和云安全组仍需核对。
 
 命令行入口：
 
@@ -1643,16 +1624,16 @@ d rc
 进入 Bitwarden 管理默认展示：
 
 ```bash
-grep '^\[BitwardenBackup\]' /var/lib/docker/volumes/vaultwarden-rclone-data/_data/rclone/rclone.conf
+bitwarden_rclone_config_status
 ```
-解释：检测 vaultwarden-backup 使用的 rclone 配置里是否存在 `[BitwardenBackup]`。
+解释：通过 Docker 实际挂载查找配置，对备份容器指定的 remote 和目录做读取验证；不再把配置节存在当作凭据有效。
 
 配置 rclone.conf 文件：
 
 ```bash
 bitwarden_configure_rclone_conf
 ```
-解释：先暂存配置，再通过容器只读挂载执行 `rclone lsd BitwardenBackup:` 实际验证。验证失败保留旧配置，成功后原子更新 Docker volume 中的配置；不会输出完整配置或 token。
+解释：从主机配置选择有效 remote，保留目标的其他 remote 及必要依赖。使用本机已有备份镜像、`--entrypoint rclone` 直接验证，避免镜像入口吞掉错误；候选配置可在隔离目录正常刷新 token。验证成功后注册所需 named volume，再原子更新实际挂载中的配置；检测期间原文件被其他进程更新则停止，不覆盖并发刷新。不会下载云端整份旧配置、拉取新镜像或输出 token。
 
 数据备份：
 
@@ -1665,15 +1646,9 @@ docker exec -i vaultwarden-backup bash /app/backup.sh
 数据还原：
 
 ```bash
-rclone ls qq3303338052@outlook:/BitwardenBackup
-rclone copy qq3303338052@outlook:/BitwardenBackup/backup.20251231.zip $(pwd)/
-docker run --rm -it \
-  --mount type=volume,source=vaultwarden-data,target=/bitwarden/data/ \
-  --mount type=bind,source=$(pwd),target=/bitwarden/restore/ \
-  ttionya/vaultwarden-backup:latest restore \
-  --zip-file backup.20251231.zip
+bitwarden_restore_data
 ```
-解释：先列出远程备份并按日期倒序显示，用户选择后把 `backup.20251231.zip` 替换为实际备份文件名；如果当前目录没有该 zip，会先下载再执行还原。
+解释：要求本机普通 local named volume 已存在，使用者已停止。自动读取备份容器的 remote、目录及数据卷，失效时可选有效 remote。备份按日期倒序列出，始终重新下载至私有目录并验证内容，不信任当前目录同名 ZIP。检查压缩及解压空间；密码隐藏输入，使用无网络、只读根文件系统的临时容器解密，再以 Python 标准库验证 SQLite 完整性、必要表和 tar 路径，拒绝路径穿越、符号链接及歧义文件。确认后替换数据，失败保留或恢复原卷；还原后容器保持停止，由用户启动并验证登录。仅支持 SQLite；外部数据库使用对应原生恢复工具，不改为 `./data`。
 
 配置 Bitwarden 同步脚本：
 
