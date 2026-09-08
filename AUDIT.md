@@ -168,3 +168,47 @@ git diff --check
 - [tcpfit 固定源码](https://github.com/Kylin010/tcpfit/tree/1163c20e88a4a7130ef7d885da8be3a163505003)、[用户提供的帖子](https://www.nodeseek.com/post-865242-1)
 - [TcpQuality 固定源码](https://github.com/ibsgss/TcpQuality/tree/c2295ae096437859ce4bbc36f170428fcac47be9)
 - [Linux 6.8 IP sysctl](https://docs.kernel.org/6.8/networking/ip-sysctl.html)、[Linux net sysctl](https://docs.kernel.org/admin-guide/sysctl/net.html)、[tcp(7)](https://man7.org/linux/man-pages/man7/tcp.7.html)
+
+## 迁移代码修复与双机验证（2026-09-08）
+
+本轮只处理迁移脚本，Mihomo 安装和 DNS 切换由用户负责。保留 Vaultwarden named volumes，不修改业务 Compose，不执行生产备份、云端同步或生产数据恢复。代码提交为 `82f24d3`、`17458e3`。
+
+### 修复内容
+
+- rclone 管理与恢复不再写死 remote；隔离配置副本读取验证，区分有效、认证无效、无法检测，不显示 token。读取成功不能证明备份可写。
+- 目录列表改用 JSON，保留连续空格，修复 `08` 编号；恢复增加路径、符号链接、活动挂载、空间检查，暂存并用 `rclone check --download` 核对后再合并。替换失败回滚；并发出现目标时保留回滚副本。
+- Nginx 本地与远程恢复共用事务逻辑，补齐依赖，按启用清单建链接，检查证书期限、私钥配对及实际服务状态；失败恢复原配置和原先停止状态。相对软链接可重复恢复，不猜测启用其他站点。
+- Compose 使用实际项目 labels 和常见配置文件名，检查缺失 bind/named volume、代理和健康状态；查询失败不执行启动，已健康项目不重建。真实 Docker 测试补充修复 `IPAM.Config=null` 被误报为代理无效的问题。
+- Vaultwarden 根据实际挂载选择配置与数据卷，通过备份镜像的 `--entrypoint rclone` 验证，避免上游包装入口吞掉失败。保留其他 remote，检测并发配置变化；ZIP 隔离解密、SQLite/归档校验后恢复已停止的普通 local named volume。
+- 生成的同步脚本原子写入并传递失败。现有生产生成脚本没有被重写或执行，需以后通过原菜单重新配置。
+
+### 验证结果
+
+两机为用户指定的华为云与腾讯云，均为 x86_64、rclone 1.75.1；Docker Compose 分别为 5.0.1、5.5.1。每次推送后使用内置 `00 -> 1` 更新，没有覆盖生产主脚本。华为云第一次更新读到旧内容，哈希验证拒绝将其计入新版结果；再次内置更新后匹配。最终两机 `/usr/local/bin/d` 和 `/root/linux-daimon/linux-toolbox.sh` 去除部署保留字段后的 SHA256 均为 `933397dd611c368212e94c4ca61fbc704def60393dfde47c4c8765d2d7d7886b`。
+
+| 检查 | 结果 |
+|---|---|
+| 新迁移回归 `bash tests/migration-regression.sh` | 两机分别 46 passed, 0 failed；新增 IPAM 测试在前一提交失败、修正版通过 |
+| 原回归 `bash tests/regression.sh` | 本地和两机分别 67 passed, 0 failed |
+| 语法和菜单审计 | `bash -n`、`git diff --check` 通过；729 patterns、90 case blocks、11 embedded Bash scripts |
+| rclone 实际恢复 | 华为云只读 HTTP 源经 SSH 隧道供腾讯云读取；含连续空格目录、隐藏文件及二进制文件，保留/覆盖策略和内容比较通过；华为云也完成本机隔离恢复 |
+| Nginx 实际恢复 | 两机独立配置、PID 和 loopback HTTPS 端口；有效证书、相对链接重试、错误配置回滚后 HTTPS 均通过，未重载生产 Nginx |
+| Compose 实际启动 | 两机现有镜像的专用容器；启动与健康等待、再次调用不重建、活动挂载拦截、unhealthy 拒绝均通过；生产项目仅做只读检查 |
+| Vaultwarden 实际恢复 | 两机专用 named volumes；配置替换保留其他 remote、加密 ZIP 恢复、错误密码不改原数据、活动卷拦截均通过；生产卷未参与 |
+
+两机各 4 组实际集成检查最终全部通过。腾讯云重复测试曾因旧夹具 SQLite 表已存在而失败，清理单个测试数据库后重跑通过。没有拉取新镜像；华为云剩余空间约 265 MiB，没有进行大数据恢复、重启或断电测试。
+
+### 生产状态与限制
+
+- 两机生产容器 ID、镜像、运行状态、启动时间、重启计数与基线一致。腾讯云 12 个生产容器运行；华为云保留原先 4 个运行容器，其余未启动。
+- 业务 Compose、Nginx 配置/证书、UFW、SSH、cron 和已有备份脚本哈希均未变化；腾讯云 Vaultwarden 配置卷也未变化。
+- 唯一观察到的配置变化是腾讯云主机 `/root/.config/rclone/rclone.conf`，mtime 为 `2026-09-08 14:43:46 UTC`，Outlook token 的当前有效期为 `2026-09-08 23:43:45 +08:00`。缺少原始写入追踪，不能确认写入来源，也未回退可能刷新的凭据。随后逐 remote 复验，配置枚举及 4 次隔离检测均确认原文件哈希不变。
+- 两机 4 个主机 remote 均读取有效；腾讯云 Vaultwarden 实际配置读取有效。华为云缺少备份容器，不能由其环境确定备份 remote，报告无法检测，不当作凭据已失效。
+- 腾讯云 CPA 和 sub2api 的容器到宿主机代理 TCP 检查通过。华为云 Emby 的 `172.26.0.1:42005` 不可达，已报告，未修改代理或防火墙。
+- 13 个生产域名 HTTPS 检查均通过证书验证。`cpa`、`mcphub`、`mypassword`、`new-api`、`openlist`、`sub2api` 返回 200；`SearchMcpHub` 返回 302、`cpa-manager` 返回 307；`syncclipboard` 和 `mihomo` 未认证返回 401。没有执行用户登录，也不将 200/401 当作登录和数据完整性验证。
+- `emby`、`QMediaSync`、`model-detect` 仍返回 502：腾讯云相关上游 `127.0.0.1:38095`、`:33333`、`:20020` 不可达。Emby/QMediaSync 未在腾讯云运行；model-detect 虽有 `/root/model-detect/deploy/model-detect.service`，系统 service 为 `not-found`。这属于未启动业务或未安装系统服务，未越权启动，复制 `/root` 或 Compose 一键启动不能覆盖这种 systemd 部署。
+- 未实测生产备份写入、云安全组修改、系统包安装失败及跨重启自启；对应安全失败路径以隔离回归验证。目录恢复不能补回原备份从未包含的 root 层文件、隐藏配置、外部 binds、volumes、UID/GID 或系统 cron。
+
+### 清理
+
+核对绝对路径、所有容器挂载、系统挂载、cron 和进程引用后，删除腾讯云旧 agent 目录 `/root/vaultwarden/migration-20260908`、`/root/syncclipboard/migration-20260908`、`/root/linux-daimon/audit-20260907`，合计约 211 MiB。源服务器原数据、生产 volumes 和云端历史 ZIP 保留。两机本轮专用容器/卷、HTTP/Nginx 测试进程及 SSH 隧道已清理，隔离任务目录也已移除。少量脱敏结果与基线保留在本地被忽略的 `.tmp/migration-code-test-20260908/`。
