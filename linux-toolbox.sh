@@ -20671,7 +20671,7 @@ for name in active:
                 ipaddress.ip_address(address)
                 pid = container["State"]["Pid"] if container else 0
                 proxies.append((name, address, port, pid))
-                gateways = {c.get("Gateway") for n in networks.values() for c in n.get("IPAM", {}).get("Config", [])}
+                gateways = {c.get("Gateway") for n in networks.values() for c in (n.get("IPAM") or {}).get("Config") or []}
                 if container and address in gateways:
                     for network in container["NetworkSettings"]["Networks"]:
                         for entry in networks.get(network, {}).get("IPAM", {}).get("Config", []):

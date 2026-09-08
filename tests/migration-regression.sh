@@ -249,6 +249,26 @@ test_compose_missing_bind() {
     docker() { :; }
     ! rclone_compose_preflight "$WORK"
 }
+test_compose_null_ipam() {
+    rclone_compose_run() {
+        shift
+        case "$*" in
+            'config --format json') printf '{"name":"fixture","services":{"app":{"network_mode":"host","environment":{"HTTP_PROXY":"http://127.0.0.1:28781"}}}}\n' ;;
+            'config --services') printf 'app\n' ;;
+            *) return 1 ;;
+        esac
+    }
+    docker() {
+        case "$*" in
+            'ps -aq'|'volume ls -q') return 0 ;;
+            'network ls -q') echo fixture ;;
+            'network inspect fixture') printf '[{"Name":"host","IPAM":{"Config":null}}]\n' ;;
+            *) return 1 ;;
+        esac
+    }
+    timeout() { shift; "$@"; }
+    rclone_compose_preflight "$WORK" verify
+}
 test_compose_failed_ps_caller() {
     local output
     docker() { :; }
@@ -391,6 +411,7 @@ for mode in valid invalid unknown; do check "remote status $mode" test_remote_st
 for mode in success missing invalid link relative stopped; do check "Nginx transaction $mode" test_nginx_transaction "$mode"; done
 for mode in healthy unhealthy starting error; do check "Compose state $mode" test_compose_state "$mode"; done
 check 'missing bind source prevents Compose startup' test_compose_missing_bind
+check 'Compose accepts null IPAM config when validating a host proxy' test_compose_null_ipam
 check 'failed Compose status query cannot become startup' test_compose_failed_ps_caller
 for mode in success invalid concurrent; do check "credential transaction $mode" test_credentials_transaction "$mode"; done
 for mode in success corrupt traversal; do check "Vaultwarden archive $mode" test_vault_archive "$mode"; done
