@@ -52,6 +52,7 @@ mkdir -p /root/linux-daimon/daimon
 17. crontab同步脚本管理
 ---
 18. 常用的一键脚本
+19. 服务器退役
 00. 脚本更新
 0. 退出脚本
 
@@ -1814,3 +1815,26 @@ bash /root/linux-daimon/daimon/sing-box-daimon.sh
 bash /root/linux-daimon/daimon/runTcpQuality.sh
 ```
 解释：TcpQuality TCP SYN 重传检测，来源 `https://raw.githubusercontent.com/daimon3332/TcpQuality/main/runTcpQuality.sh`。
+
+## 19. 服务器退役
+
+顶部只读检测：
+
+```bash
+docker ps -a --format '{{.Names}}'
+docker inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' 容器名
+find /etc/nginx/sites-enabled /etc/nginx/sites-available /home/web/conf.d -maxdepth 1 \( -type f -o -type l \)
+crontab -l
+```
+解释：按 Compose 项目、Nginx 域名配置和托管脚本展示当前状态，不执行删除或停止。
+
+一键退役：
+
+```bash
+docker compose -p 项目名 -f compose.yml down
+rm -f /etc/nginx/sites-enabled/站点
+rm -f /etc/nginx/sites-available/站点 /home/web/conf.d/站点
+rm -rf /root/domain/域名
+crontab -l | awk -v path="/root/linux-daimon/backup-sh/脚本名.sh" '/^[[:space:]]*#/ || index(" " $0 " ", " " path " ") == 0' | crontab -
+```
+解释：菜单 1 默认预填全部 `C/N/A/U/R` 编号，用户可删减后输入 `RETIRE` 确认；每类按编号倒序执行。Compose 停止不带 `-v`，保留卷、挂载和镜像；脚本和任务仅限托管目录。不会修改 DNS、UFW、Mihomo、SSH 或 rclone 配置，也不会创建备份。

@@ -392,6 +392,51 @@ test_symlink_restore_guard() {
     ! rclone_tree_safe "$fixture/alias"
 }
 
+test_retire_cron_exact_cleanup() {
+    local fixture="$WORK/retire-cron" current_file="$WORK/retire-cron.current" next_file="$WORK/retire-cron.next"
+    mkdir -p "$fixture"
+    printf '%s\n' "# keep /root/linux-daimon/backup-sh/task.sh in documentation" "0 1 * * * /root/linux-daimon/backup-sh/task.sh" "0 2 * * * /root/linux-daimon/backup-sh/task.sh-extra" "0 3 * * * /root/keep.sh" > "$current_file"
+    load_function server_retire_remove_cron_path || return 1
+    crontab() {
+        if [ "$1" = "-l" ]; then cat "$current_file"; return 0; fi
+        cat > "$next_file"
+        cp "$next_file" "$current_file"
+    }
+    server_retire_remove_cron_path /root/linux-daimon/backup-sh/task.sh || return 1
+    grep -Fq 'documentation' "$current_file" && ! grep -Fxq '0 1 * * * /root/linux-daimon/backup-sh/task.sh' "$current_file" && grep -Fq 'task.sh-extra' "$current_file" && grep -Fq '/root/keep.sh' "$current_file"
+}
+
+test_retire_compose_preserves_volumes() {
+    local fixture="$WORK/retire-compose" log="$WORK/retire-compose.log"
+    mkdir -p "$fixture"
+    load_function server_retire_compose_stop || return 1
+    root_use() { :; }
+    docker() {
+        printf '%s\n' "$*" >> "$log"
+        [[ "$*" != *' -v '* && "$*" != *' --volumes '* ]]
+    }
+    server_retire_compose_stop fixture "$fixture" "" || return 1
+    grep -q 'compose -p fixture down' "$log"
+}
+
+test_retire_script_path_guard() {
+    local fixture="$WORK/retire-guard"
+    mkdir -p "$fixture"
+    load_function server_retire_remove_script || return 1
+    root_use() { :; }
+    ! server_retire_remove_script /tmp/not-managed.sh
+}
+
+test_retire_bulk_order() {
+    local log="$WORK/retire-order.log"
+    : > "$log"
+    load_function server_retire_apply_token || return 1
+    load_function server_retire_apply_tokens_for_prefix || return 1
+    server_retire_apply_token() { printf '%s\n' "$1" >> "$log"; }
+    server_retire_apply_tokens_for_prefix N 'N1 N10 N2' || return 1
+    [ "$(tr '\n' ' ' < "$log")" = 'N10 N2 N1 ' ]
+}
+
 check 'missing nginx must fail' test_missing_nginx
 check 'reload and restart failure must fail' test_reload_failure
 check 'link failure must propagate' test_link_failure
@@ -420,6 +465,10 @@ check 'remote names and types do not expose tokens' test_remote_names_privacy
 check 'Compose labels preserve project name and override files' test_compose_context_labels
 check 'missing certificate files fail validation' test_missing_certificate_files
 check 'symlink restoration target is rejected' test_symlink_restore_guard
+check 'retirement cron cleanup removes only exact managed path' test_retire_cron_exact_cleanup
+check 'retirement Compose stop preserves volumes' test_retire_compose_preserves_volumes
+check 'retirement script path guard rejects unmanaged paths' test_retire_script_path_guard
+check 'retirement bulk processing keeps descending indexes' test_retire_bulk_order
 
 printf '%s passed, %s failed\n' "$passed" "$failed"
 [ "$failed" -eq 0 ]

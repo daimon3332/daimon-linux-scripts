@@ -48,6 +48,7 @@ d
 | 16 | Bitwarden管理 | 配置 vaultwarden-backup 的 rclone.conf、执行备份和还原 |
 | 17 | crontab同步脚本管理 | 管理 Bitwarden、图床、Via、域名和 Nginx 配置备份、自定义同步脚本 |
 | 18 | 常用的一键脚本 | 运行 NodeQuality、IPQuality、YABS、kejilion.sh 等脚本 |
+| 19 | 服务器退役 | 只读检测并按选择停止 Compose、删除托管 Nginx 配置/证书目录和自动任务脚本 |
 
 ## 主要内容
 
@@ -345,6 +346,12 @@ Compose 自动更新不会预先执行 `docker compose down`。每个任务使�
 | 10 | kejilion.sh | `bash <(curl -sL kejilion.sh)` |
 | 11 | sing-box安装 | `bash <(curl -fsSL https://raw.githubusercontent.com/daimon3332/sing-box-daimon/main/sb.sh)` |
 | 12 | TcpQuality | `bash <(curl -fsSL https://raw.githubusercontent.com/daimon3332/TcpQuality/main/runTcpQuality.sh)` |
+
+### 服务器退役
+
+进入菜单后顶部只读显示 Docker Compose、Nginx 配置、自动同步脚本、Compose 自动更新脚本和证书续期任务状态。菜单 1 会预填当前全部项目编号，用户可以删除不需要处理的编号，输入 `RETIRE` 后执行；各类别批量操作按编号倒序处理，避免删除前面的项目后编号错位。
+
+退役操作会停止 Compose 服务（不使用 `-v`，保留 named volume、bind mount 和镜像），删除托管路径下的 Nginx 配置及 `/root/domain/<域名>` 证书目录，并删除对应脚本和精确匹配的 crontab 任务。只允许处理 `/etc/nginx/sites-enabled`、`/etc/nginx/sites-available`、`/home/web/conf.d`、脚本托管目录和证书续期脚本；不会修改 DNS、UFW、Mihomo、SSH 或 rclone 配置，也不会自动创建备份。
 
 ## 第三方脚本引用
 

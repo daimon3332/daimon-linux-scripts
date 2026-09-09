@@ -21885,6 +21885,289 @@ crontab_sync_manager() {
 	done
 }
 
+server_retire_compose_stop() {
+	local project="$1" workdir="$2" config_files="$3" config_file
+	local -a args=("-p" "$project") compose_files=()
+	root_use
+	[ -d "$workdir" ] || { echo -e "${gl_hong}项目目录不存在: $workdir${gl_bai}"; return 1; }
+	if [ -n "$config_files" ]; then
+		IFS=',' read -r -a compose_files <<< "$config_files"
+		for config_file in "${compose_files[@]}"; do
+			[ "${config_file#/}" = "$config_file" ] && config_file="$workdir/$config_file"
+			[ -f "$config_file" ] || { echo -e "${gl_hong}Compose 配置不存在: $config_file${gl_bai}"; return 1; }
+			args+=("-f" "$config_file")
+		done
+	fi
+	( cd "$workdir" && docker compose "${args[@]}" down )
+}
+
+server_retire_compose_item() {
+	docker_compose_update_get_item_by_number "$1"
+}
+
+server_retire_nginx_items() {
+	local dir file canonical domains enabled link
+	local -A seen=()
+	for dir in /etc/nginx/sites-enabled /etc/nginx/sites-available /home/web/conf.d; do
+		[ -d "$dir" ] || continue
+		while IFS= read -r -d '' file; do
+			domains=$(awk '/^[[:space:]]*server_name[[:space:]]/ { for (i=2; i<=NF; i++) { gsub(";", "", $i); if ($i != "_" && $i !~ /^\$/) print $i } }' "$file" 2>/dev/null | while read -r domain; do validate_domain_name "$domain" && printf '%s\n' "$domain"; done | sort -u | paste -sd, -)
+			[ -n "$domains" ] || continue
+			canonical=$(realpath -m -- "$file" 2>/dev/null || printf '%s' "$file")
+			[ -n "${seen[$canonical]:-}" ] && continue
+			seen["$canonical"]=1
+			enabled=false
+			for link in /etc/nginx/sites-enabled/*; do
+				[ -e "$link" ] || [ -L "$link" ] || continue
+				[ "$(realpath -m -- "$link" 2>/dev/null)" = "$canonical" ] && enabled=true
+			done
+			printf '%s\t%s\t%s\n' "$canonical" "$domains" "$enabled"
+		done < <(find "$dir" -maxdepth 1 \( -type f -o -type l \) -print0 2>/dev/null)
+	done | sort -u
+}
+
+server_retire_nginx_item() {
+	local target="$1" idx=0 file domains enabled
+	while IFS=$'\t' read -r file domains enabled; do
+		idx=$((idx + 1))
+		[ "$idx" -eq "$target" ] && { printf '%s\t%s\t%s\n' "$file" "$domains" "$enabled"; return 0; }
+	done < <(server_retire_nginx_items)
+	return 1
+}
+
+server_retire_nginx_remove() {
+	local file="$1" domains="$2" link domain
+		case "$file" in
+			/etc/nginx/sites-enabled/*|/etc/nginx/sites-available/*|/home/web/conf.d/*) ;;
+			*) echo -e "${gl_hong}跳过非托管 Nginx 路径: $file${gl_bai}"; return 1 ;;
+		esac
+	for link in /etc/nginx/sites-enabled/*; do
+		[ -e "$link" ] || [ -L "$link" ] || continue
+		[ "$(realpath -m -- "$link" 2>/dev/null)" = "$(realpath -m -- "$file" 2>/dev/null)" ] && rm -f -- "$link"
+	done
+	rm -f -- "$file" || return 1
+	IFS=',' read -r -a domains_array <<< "$domains"
+	for domain in "${domains_array[@]}"; do
+		validate_domain_name "$domain" || continue
+		case "$domain" in
+			*.*) rm -rf -- "/root/domain/$domain" ;;
+		esac
+	done
+}
+
+server_retire_nginx_reload() {
+	if command -v nginx >/dev/null 2>&1; then
+		nginx -t && nginx -s reload
+	elif docker inspect nginx >/dev/null 2>&1; then
+		docker exec nginx nginx -t && docker exec nginx nginx -s reload
+	else
+		echo -e "${gl_huang}未检测到 Nginx，已跳过 reload。${gl_bai}"
+	fi
+}
+
+server_retire_sync_dirs() {
+	printf '%s\n' "$(crontab_sync_backup_dir)" /root/backup-sh
+}
+
+server_retire_update_dirs() {
+	printf '%s\n' "$(docker_compose_update_script_dir)" /root/docker-compose-update
+}
+
+server_retire_script_items() {
+	local dir file cron_output
+	cron_output=$(crontab -l 2>/dev/null || true)
+	while IFS= read -r dir; do
+		[ -d "$dir" ] || continue
+		while IFS= read -r -d '' file; do
+			printf '%s\t%s\n' "$file" "$(printf '%s\n' "$cron_output" | awk -v path="$file" '/^[[:space:]]*#/ {next} {p=" " $0 " "; if (index(p, " " path " ")) found=1} END {exit !found}' && echo true || echo false)"
+		done < <(find "$dir" -maxdepth 1 -type f -name '*.sh' -print0 2>/dev/null)
+	done < <(server_retire_sync_dirs) | sort -u
+}
+
+server_retire_update_items() {
+	local dir file cron_output
+	cron_output=$(crontab -l 2>/dev/null || true)
+	while IFS= read -r dir; do
+		[ -d "$dir" ] || continue
+		while IFS= read -r -d '' file; do
+			printf '%s\t%s\n' "$file" "$(printf '%s\n' "$cron_output" | awk -v path="$file" '/^[[:space:]]*#/ {next} {p=" " $0 " "; if (index(p, " " path " ")) found=1} END {exit !found}' && echo true || echo false)"
+		done < <(find "$dir" -maxdepth 1 -type f -name 'compose_update_*.sh' -print0 2>/dev/null)
+	done < <(server_retire_update_dirs) | sort -u
+}
+
+server_retire_remove_cron_path() {
+	local path="$1" current next
+	current=$(crontab -l 2>/dev/null || true)
+	next=$(printf '%s\n' "$current" | awk -v path="$path" '/^[[:space:]]*#/ {print; next} {p=" " $0 " "; if (index(p, " " path " ")) next; print}')
+	printf '%s\n' "$next" | sed '/^[[:space:]]*$/d' | crontab -
+}
+
+server_retire_remove_script() {
+	local file="$1" real dir allowed=false
+	real=$(realpath -m -- "$file" 2>/dev/null || printf '%s' "$file")
+	while IFS= read -r dir; do
+		case "$real" in "$(realpath -m -- "$dir")"/*) allowed=true ;; esac
+	done < <(server_retire_sync_dirs; server_retire_update_dirs)
+	case "$real" in "$(realpath -m -- "$DAIMON_SCRIPT_DIR")/auto_cert_renewal.sh") allowed=true ;; esac
+	$allowed || { echo -e "${gl_hong}跳过非托管脚本: $file${gl_bai}"; return 1; }
+	server_retire_remove_cron_path "$file" || return 1
+	rm -f -- "$file"
+}
+
+server_retire_show_status() {
+	local count=0 running project workdir config_files file domains enabled cron_state active=0 cert_file
+	echo "服务器退役状态（只读检测，不会自动删除）"
+	echo "------------------------"
+	while IFS=$'\t' read -r project workdir config_files; do
+		[ -n "$project" ] || continue
+		count=$((count + 1)); running=$(docker ps -q --filter "label=com.docker.compose.project=$project" | wc -l | tr -d ' ')
+		[ "$running" -gt 0 ] && cron_state="运行中" || cron_state="已停止"
+		echo "Compose $count: $project [$cron_state]"
+	done < <(docker_compose_update_discover_projects)
+	[ "$count" -eq 0 ] && echo "Compose 项目：未检测到"
+	count=0; active=0
+	while IFS=$'\t' read -r file domains enabled; do count=$((count + 1)); [ "$enabled" = true ] && active=$((active + 1)); done < <(server_retire_nginx_items)
+	echo "Nginx 域名配置：$active 个启用，$((count - active)) 个未启用"
+	count=0
+	while IFS=$'\t' read -r file cron_state; do count=$((count + 1)); done < <(server_retire_script_items)
+	active=$count; count=0
+	while IFS=$'\t' read -r file cron_state; do count=$((count + 1)); done < <(server_retire_update_items)
+	echo "自动同步脚本：$active 个，Compose 自动更新脚本：$count 个"
+	cert_file="$DAIMON_SCRIPT_DIR/auto_cert_renewal.sh"
+	if [ -f "$cert_file" ] && printf '%s\n' "$(crontab -l 2>/dev/null || true)" | awk -v path="$cert_file" '/^[[:space:]]*#/ {next} {p=" " $0 " "; if (index(p, " " path " ")) found=1} END {exit !found}'; then
+		echo "证书自动续期：已配置"
+	elif [ -f "$cert_file" ]; then
+		echo "证书自动续期：脚本存在，未加入定时"
+	elif printf '%s\n' "$(crontab -l 2>/dev/null || true)" | awk -v path="$cert_file" '/^[[:space:]]*#/ {next} {p=" " $0 " "; if (index(p, " " path " ")) found=1} END {exit !found}'; then
+		echo "证书自动续期：定时存在，脚本不存在"
+	else
+		echo "证书自动续期：未检测到"
+	fi
+	echo "DNS 服务商记录：不会由本功能修改"
+	echo "------------------------"
+}
+
+server_retire_all_numbers() {
+	local n=0 line
+	while IFS= read -r line; do [ -n "$line" ] && n=$((n + 1)) && printf 'C%s ' "$n"; done < <(docker_compose_update_discover_projects)
+	n=0; while IFS= read -r line; do [ -n "$line" ] && n=$((n + 1)) && printf 'N%s ' "$n"; done < <(server_retire_nginx_items)
+	n=0; while IFS= read -r line; do [ -n "$line" ] && n=$((n + 1)) && printf 'A%s ' "$n"; done < <(server_retire_script_items)
+	n=0; while IFS= read -r line; do [ -n "$line" ] && n=$((n + 1)) && printf 'U%s ' "$n"; done < <(server_retire_update_items)
+	if printf '%s\n' "$(crontab -l 2>/dev/null || true)" | awk -v path="$DAIMON_SCRIPT_DIR/auto_cert_renewal.sh" '/^[[:space:]]*#/ {next} {p=" " $0 " "; if (index(p, " " path " ")) found=1} END {exit !found}'; then printf 'R1 '; fi
+}
+
+server_retire_apply_token() {
+	local token="$1" n item idx project workdir config_files file domains enabled
+	case "$token" in
+		C[0-9]*) n="${token#C}"; item=$(server_retire_compose_item "$n") || return 1; IFS=$'\t' read -r idx project workdir config_files <<< "$item"; server_retire_compose_stop "$project" "$workdir" "$config_files" ;;
+		N[0-9]*) n="${token#N}"; item=$(server_retire_nginx_item "$n") || return 1; IFS=$'\t' read -r file domains enabled <<< "$item"; server_retire_nginx_remove "$file" "$domains" ;;
+		A[0-9]*) n="${token#A}"; file=$(server_retire_script_items | sed -n "${n}p" | cut -f1); [ -n "$file" ] || return 1; server_retire_remove_script "$file" ;;
+		U[0-9]*) n="${token#U}"; file=$(server_retire_update_items | sed -n "${n}p" | cut -f1); [ -n "$file" ] || return 1; server_retire_remove_script "$file" ;;
+		R1) server_retire_remove_script "$DAIMON_SCRIPT_DIR/auto_cert_renewal.sh" ;;
+		*) return 1 ;;
+	esac
+}
+
+server_retire_apply_tokens_for_prefix() {
+	local prefix="$1" nums="$2" token
+	for token in $nums; do
+		case "$token" in
+			"$prefix"[0-9]*) printf '%s\n' "$token" ;;
+		esac
+	done | sort -k1.2nr | while IFS= read -r token; do
+		server_retire_apply_token "$token" || echo -e "${gl_hong}处理失败或编号无效: $token${gl_bai}"
+	done
+}
+
+server_retire_bulk() {
+	local nums token
+	nums=$(server_retire_all_numbers)
+	[ -n "$nums" ] || { echo "没有检测到可退役项目。"; return 0; }
+	read -e -i "$nums" -p "请确认/修改退役项目编号（C=Compose N=Nginx A=同步脚本 U=自动更新 R=证书续期）: " nums || return 1
+	[ -n "$nums" ] || { echo "已取消"; return 0; }
+	read -r -p "将执行所选退役操作，输入 RETIRE 确认: " token || return 1
+	[ "$token" = "RETIRE" ] || { echo "已取消"; return 0; }
+	server_retire_apply_tokens_for_prefix C "$nums"
+	server_retire_apply_tokens_for_prefix N "$nums"
+	server_retire_apply_tokens_for_prefix A "$nums"
+	server_retire_apply_tokens_for_prefix U "$nums"
+	case " $nums " in
+		*' R1 '*) server_retire_apply_token R1 || echo -e "${gl_hong}证书续期任务处理失败${gl_bai}" ;;
+	esac
+	server_retire_nginx_reload || echo -e "${gl_hong}Nginx reload 失败，请检查配置。${gl_bai}"
+}
+
+server_retire_compose_menu() {
+	local nums n item idx project workdir config_files confirm
+	idx=0
+	while IFS=$'\t' read -r project workdir config_files; do
+		idx=$((idx + 1)); echo "$idx. $project [$workdir]"
+	done < <(docker_compose_update_discover_projects)
+	read -e -p "请输入要停止的 Compose 编号（空格多选）: " nums || return 1
+	read -r -p "确认停止所选 Compose 服务？(y/N): " confirm || return 1
+	[[ "$confirm" =~ ^[Yy]$ ]] || return 0
+	for n in $(printf '%s\n' $nums | sort -nr); do item=$(server_retire_compose_item "$n") || continue; IFS=$'\t' read -r idx project workdir config_files <<< "$item"; server_retire_compose_stop "$project" "$workdir" "$config_files"; done
+}
+
+server_retire_nginx_menu() {
+	local nums n item file domains enabled confirm
+	local idx=0
+	while IFS=$'\t' read -r file domains enabled; do idx=$((idx + 1)); echo "$idx. $domains [$enabled] $file"; done < <(server_retire_nginx_items)
+	read -e -p "请输入要删除的 Nginx 配置编号（空格多选）: " nums || return 1
+	read -r -p "确认删除所选 Nginx 配置和证书目录？(y/N): " confirm || return 1
+	[[ "$confirm" =~ ^[Yy]$ ]] || return 0
+	for n in $(printf '%s\n' $nums | sort -nr); do item=$(server_retire_nginx_item "$n") || continue; IFS=$'\t' read -r file domains enabled <<< "$item"; server_retire_nginx_remove "$file" "$domains"; done
+	server_retire_nginx_reload
+}
+
+server_retire_script_menu() {
+	local kind="$1" nums n file confirm
+	local source_cmd=server_retire_script_items
+	[ "$kind" = update ] && source_cmd=server_retire_update_items
+	local idx=0
+	while IFS=$'\t' read -r file cron_state; do idx=$((idx + 1)); echo "$idx. $file [$cron_state]"; done < <($source_cmd)
+	read -e -p "请输入要删除的脚本编号（空格多选）: " nums || return 1
+	read -r -p "确认删除所选脚本和定时任务？(y/N): " confirm || return 1
+	[[ "$confirm" =~ ^[Yy]$ ]] || return 0
+	for n in $(printf '%s\n' $nums | sort -nr); do file=$($source_cmd | sed -n "${n}p" | cut -f1); [ -n "$file" ] && server_retire_remove_script "$file"; done
+}
+
+server_retire_cert_menu() {
+	if [ -f "$DAIMON_SCRIPT_DIR/auto_cert_renewal.sh" ]; then
+		read -r -p "删除证书自动续期脚本和定时任务？(y/N): " confirm || return 1
+		[[ "$confirm" =~ ^[Yy]$ ]] && server_retire_remove_script "$DAIMON_SCRIPT_DIR/auto_cert_renewal.sh"
+	else
+		echo "未检测到证书自动续期脚本。"
+	fi
+}
+
+server_retire_menu() {
+	local choice
+	while true; do
+		clear
+		server_retire_show_status
+		echo "1. 一键退役（默认全选，可删除编号）"
+		echo "2. Docker Compose 服务"
+		echo "3. Nginx 域名配置"
+		echo "4. 自动同步脚本"
+		echo "5. Docker Compose 自动更新"
+		echo "6. 证书自动续期任务"
+		echo "0. 返回主菜单"
+		read -e -p "请输入你的选择: " choice || return 1
+		case "$choice" in
+			1) server_retire_bulk ;;
+			2) server_retire_compose_menu ;;
+			3) server_retire_nginx_menu ;;
+			4) server_retire_script_menu sync ;;
+			5) server_retire_script_menu update ;;
+			6) server_retire_cert_menu ;;
+			0) return ;;
+			*) echo "无效的输入!" ;;
+		esac
+		break_end
+	done
+}
+
 
 warp_manager() {
 	while true; do
@@ -22060,6 +22343,7 @@ echo -e "${gl_kjlan}16.  ${gl_bai}Bitwarden管理"
 echo -e "${gl_kjlan}17.  ${gl_bai}crontab同步脚本管理"
 echo -e "${gl_kjlan}------------------------${gl_bai}"
 echo -e "${gl_kjlan}18.  ${gl_bai}常用的一键脚本"
+echo -e "${gl_kjlan}19.  ${gl_bai}服务器退役"
 echo -e "${gl_kjlan}------------------------${gl_bai}"
 echo -e "${gl_kjlan}00.  ${gl_bai}脚本更新"
 echo -e "${gl_kjlan}------------------------${gl_bai}"
@@ -22086,6 +22370,7 @@ case $choice in
   16) bitwarden_manager; pause_after=false ;;
   17) crontab_sync_manager; pause_after=false ;;
   18) common_one_click_scripts; pause_after=false ;;
+  19) server_retire_menu; pause_after=false ;;
   00) kejilion_update; pause_after=false ;;
   0) clear ; exit ;;
   *) echo "无效的输入!" ;;
@@ -22114,6 +22399,7 @@ echo "fail2ban管理        d fail2ban | d f2b"
 echo "rclone管理          d rclone | d rc"
 echo "Bitwarden管理       d bitwarden | d bw"
 echo "crontab同步脚本管理 d cronsync | d syncscripts"
+echo "服务器退役        d retire | d 退役"
 echo "显示系统信息        d info"
 echo "ROOT密钥管理        d sshkey"
 }
@@ -22336,6 +22622,10 @@ else
 
 		cronsync|syncscripts|cron-sync)
 			crontab_sync_manager
+			;;
+
+		retire|退役)
+			server_retire_menu
 			;;
 
 
