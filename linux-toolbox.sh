@@ -5504,8 +5504,7 @@ set_dns() {
 
 ip_address
 
-backup_resolv_conf_once
-chattr -i /etc/resolv.conf
+ chattr -i /etc/resolv.conf
 > /etc/resolv.conf
 
 if [ -n "$ipv4_address" ]; then
@@ -5528,28 +5527,14 @@ chattr +i /etc/resolv.conf
 }
 
 
-backup_resolv_conf_once() {
-	local backup_file="/etc/resolv.conf.daimon.bak"
-	if [ -f /etc/resolv.conf ] && [ ! -f "$backup_file" ]; then
-		cp -L /etc/resolv.conf "$backup_file" 2>/dev/null || cat /etc/resolv.conf > "$backup_file" 2>/dev/null || true
-	fi
-}
-
 restore_dns_config() {
-	local backup_file="/etc/resolv.conf.daimon.bak"
 	chattr -i /etc/resolv.conf >/dev/null 2>&1 || true
-
-	if [ -f "$backup_file" ]; then
-		cat "$backup_file" > /etc/resolv.conf
-		echo "已恢复之前备份的 DNS 配置: $backup_file"
-	else
-		cat > /etc/resolv.conf <<'EOF'
+cat > /etc/resolv.conf <<'EOF'
 nameserver 127.0.0.53
 options edns0 trust-ad
 search .
 EOF
-		echo "未找到备份，已恢复为 Ubuntu/systemd-resolved 常见本地 DNS: 127.0.0.53"
-	fi
+	echo "已恢复为 Ubuntu/systemd-resolved 常见本地 DNS: 127.0.0.53"
 
 	chattr -i /etc/resolv.conf >/dev/null 2>&1 || true
 }
@@ -5597,7 +5582,6 @@ while true; do
 		;;
 	  3)
 		install vim
-		backup_resolv_conf_once
 		chattr -i /etc/resolv.conf
 		vim /etc/resolv.conf
 		chattr +i /etc/resolv.conf
@@ -5647,8 +5631,6 @@ correct_ssh_config() {
 new_ssh_port() {
 
   local new_port=$1
-
-  cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
 
   sed -i '/^\s*#\?\s*Port\s\+/d' /etc/ssh/sshd_config
   echo "Port $new_port" >> /etc/ssh/sshd_config
@@ -5794,12 +5776,6 @@ fetch_remote_ssh_keys() {
 	chmod 700 "${ssh_dir}"
 	touch "${authorized_keys}"
 	chmod 600 "${authorized_keys}"
-
-	# 备份原有 authorized_keys
-	if [[ -f "${authorized_keys}" ]]; then
-		cp "${authorized_keys}" "${authorized_keys}.bak.$(date +%Y%m%d-%H%M%S)"
-		echo "已备份原有 authorized_keys 文件"
-	fi
 
 	# 追加公钥（避免重复）
 	local added=0
@@ -6607,9 +6583,6 @@ net.ipv4.tcp_slow_start_after_idle = 0"
 		CC="cubic"
 		QDISC="fq_codel"
 	fi
-
-	# ── 备份已有配置 ──
-	[ -f "$CONF" ] && cp "$CONF" "${CONF}.bak.$(date +%s)"
 
 	# ── 写入配置文件（持久化） ──
 	echo -e "${gl_lv}写入优化配置...${gl_bai}"
@@ -9330,7 +9303,6 @@ system_ipv6_status() {
 system_disable_ipv6() {
 	root_use
 	local CONF="/etc/sysctl.d/99-daimon-ipv6.conf"
-	[ -f "$CONF" ] && cp "$CONF" "${CONF}.bak.$(date +%Y%m%d%H%M%S)"
 	cat > "$CONF" <<'EOF'
 # linux-tools-daimon IPv6 配置：禁用 IPv6
 net.ipv6.conf.all.disable_ipv6 = 1
@@ -9347,7 +9319,6 @@ EOF
 system_enable_ipv6() {
 	root_use
 	local CONF="/etc/sysctl.d/99-daimon-ipv6.conf"
-	[ -f "$CONF" ] && cp "$CONF" "${CONF}.bak.$(date +%Y%m%d%H%M%S)"
 	cat > "$CONF" <<'EOF'
 # linux-tools-daimon IPv6 配置：开启 IPv6
 net.ipv6.conf.all.disable_ipv6 = 0
@@ -13211,8 +13182,6 @@ EOF
 		# 不再自动探测/纠正 API 协议；保持用户配置为准
 		DETECTED_API="openai-completions"
 
-		[[ -f "$config_file" ]] && cp "$config_file" "${config_file}.bak.$(date +%s)"
-
 		jq --arg prov "$provider_name" \
 		   --arg url "$base_url" \
 		   --arg key "$api_key" \
@@ -14544,15 +14513,12 @@ PYTHON_EOF
 			[ "$provider" = "$model_ref" ] && { provider=""; model="$model_ref"; }
 
 			local count=0
-			local agent_dir sessions_file backup_file
+			local agent_dir sessions_file
 
 			for agent_dir in "$agents_dir"/*/; do
 				[ ! -d "$agent_dir" ] && continue
 				sessions_file="$agent_dir/sessions/sessions.json"
 				[ ! -f "$sessions_file" ] && continue
-
-				backup_file="${sessions_file}.bak"
-				cp "$sessions_file" "$backup_file" 2>/dev/null || continue
 
 				if command -v jq >/dev/null 2>&1; then
 					local tmp_json
@@ -15552,12 +15518,6 @@ if os.path.isdir(agents_root):
 		tmp_unpack=$(mktemp -d) || return 1
 		local pkg_dir
 		pkg_dir=$(openclaw_prepare_import_archive "openclaw-project" "$archive_path" "$tmp_unpack") || { rm -rf "$tmp_unpack"; break_end; return 1; }
-		local rollback_dir
-		rollback_dir=$(mktemp -d)
-		if [ -d "$openclaw_root" ] && ! tar -czf "$rollback_dir/openclaw-before-restore.tar.gz" -C "$openclaw_root" .; then
-			echo "❌ 无法创建还原前备份，已中止"; rm -rf "$rollback_dir" "$tmp_unpack"; break_end; return 1
-		fi
-
 		local invalid=0
 		local valid_list
 		valid_list=$(mktemp)
@@ -15592,7 +15552,7 @@ if os.path.isdir(agents_root):
 
 		if command -v openclaw >/dev/null 2>&1; then
 			echo "▶️ 还原后启动 OpenClaw gateway..."
-			if ! openclaw gateway start >/dev/null 2>&1; then echo "❌ gateway 启动失败，请检查还原前备份: $rollback_dir/openclaw-before-restore.tar.gz"; fi
+			if ! openclaw gateway start >/dev/null 2>&1; then echo "❌ gateway 启动失败，请检查 OpenClaw 配置和日志。"; fi
 			sleep 2
 			echo "🩺 gateway 健康检查："
 			openclaw gateway status || true
@@ -15600,7 +15560,6 @@ if os.path.isdir(agents_root):
 
 		rm -f "$valid_list"
 		rm -rf "$tmp_unpack"
-		echo "还原前备份已保留: $rollback_dir/openclaw-before-restore.tar.gz"
 		echo "✅ OpenClaw 项目还原完成"
 		break_end
 	}
@@ -15904,21 +15863,13 @@ PY
 
 	openclaw_memory_rebuild_index_single() {
 		local agent_id="${1:-main}"
-		local store_raw store_file ts backup_file
+		local store_raw store_file
 		store_raw=$(openclaw_memory_status_value "Store" "$agent_id")
 		store_file=$(openclaw_memory_expand_path "$store_raw")
 		if [ -z "$store_file" ] || [ ! -f "$store_file" ]; then
 			echo "⚠️ [$agent_id] 未找到索引库文件，可能为空或不存在。"
 			echo "   Store 原始值: ${store_raw:-<空>}"
 			echo "   仍将执行重建索引。"
-		else
-			ts=$(date +%Y%m%d_%H%M%S)
-			backup_file="${store_file}.bak.${ts}"
-			if mv "$store_file" "$backup_file"; then
-				echo "✅ [$agent_id] 已备份索引: $backup_file"
-			else
-				echo "⚠️ [$agent_id] 索引备份失败，继续重建。"
-			fi
 		fi
 		openclaw memory index --agent "$agent_id" --force
 	}
@@ -16908,51 +16859,11 @@ EOF
 		echo "$(openclaw_get_config_file)"
 	}
 
-	openclaw_permission_backup_file() {
-		local backup_root
-		backup_root=$(openclaw_backup_root)
-		echo "${backup_root}/openclaw-permission-last.json"
-	}
-
 	openclaw_permission_require_openclaw() {
 		if ! openclaw_has_command openclaw; then
 			echo "❌ 未检测到 openclaw 命令，请先安装或初始化 OpenClaw。"
 			return 1
 		fi
-		return 0
-	}
-
-	openclaw_permission_backup_current() {
-		local config_file backup_file
-		config_file=$(openclaw_permission_config_file)
-		backup_file=$(openclaw_permission_backup_file)
-		if [ ! -s "$config_file" ]; then
-			echo "⚠️ 未找到 OpenClaw 配置文件，跳过权限备份。"
-			return 1
-		fi
-		mkdir -p "$(dirname "$backup_file")"
-		cp -f "$config_file" "$backup_file" >/dev/null 2>&1 || {
-			echo "⚠️ 权限备份失败：$backup_file"
-			return 1
-		}
-		echo "✅ 已备份当前权限配置: $backup_file"
-		return 0
-	}
-
-	openclaw_permission_restore_backup() {
-		local config_file backup_file
-		config_file=$(openclaw_permission_config_file)
-		backup_file=$(openclaw_permission_backup_file)
-		if [ ! -s "$backup_file" ]; then
-			echo "❌ 未找到可恢复的权限备份文件。"
-			return 1
-		fi
-		cp -f "$backup_file" "$config_file" >/dev/null 2>&1 || {
-			echo "❌ 权限恢复失败：$backup_file"
-			return 1
-		}
-		echo "✅ 已恢复切换前权限配置"
-		openclaw_permission_restart_gateway || true
 		return 0
 	}
 
@@ -18150,15 +18061,6 @@ ssh_config_manager() {
 	local SSH_CONFIG="/etc/ssh/sshd_config"
 	local DEFAULT_SSH_PORT="64400"
 
-	ssh_config_backup() {
-		[ -f "$SSH_CONFIG" ] && cp "$SSH_CONFIG" "$SSH_CONFIG.bak.$(date +%Y%m%d%H%M%S)"
-	}
-	ssh_restore_backup() {
-		local backup
-		backup=$(ls -1t "$SSH_CONFIG".bak.* 2>/dev/null | head -n1)
-		[ -n "$backup" ] && cp "$backup" "$SSH_CONFIG"
-	}
-
 	ssh_set_option() {
 		local key="$1" value="$2"
 		if grep -qiE "^[#[:space:]]*${key}[[:space:]]+" "$SSH_CONFIG" 2>/dev/null; then
@@ -18282,14 +18184,12 @@ ssh_config_manager() {
 				read -e -p "请输入新 SSH 端口（默认 $DEFAULT_SSH_PORT）: " new_port || return 1
 				new_port=${new_port:-$DEFAULT_SSH_PORT}
 				if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1 ] && [ "$new_port" -le 65535 ]; then
-					ssh_config_backup
 					if command -v ufw >/dev/null 2>&1 && ! ufw_allow_current_ssh "$new_port"; then
 						break_end; continue
 					fi
 					ssh_set_option Port "$new_port"
 					if ! ssh_restart_safe; then
-						ssh_restore_backup && ssh_restart_safe
-						echo "新 SSH 配置未能生效，已尝试恢复原配置。"
+						echo "新 SSH 配置未能生效，请手动检查 $SSH_CONFIG。"
 					fi
 				else
 					echo "端口不合法"
@@ -18298,7 +18198,6 @@ ssh_config_manager() {
 			2)
 				echo "1. 禁用密码登录    2. 开启密码登录"
 				read -e -p "请选择: " mode || return 1
-				ssh_config_backup
 				if [ "$mode" = "1" ]; then
 					ssh_set_option PasswordAuthentication no
 					ssh_set_option KbdInteractiveAuthentication no
@@ -18314,7 +18213,6 @@ ssh_config_manager() {
 			3)
 				echo "1. 开启密钥登录    2. 禁用密钥登录"
 				read -e -p "请选择: " mode || return 1
-				ssh_config_backup
 				if [ "$mode" = "1" ]; then
 					read -e -p "请粘贴公钥（可直接回车跳过）: " public_key || return 1
 					ssh_add_public_key "$public_key"
@@ -18331,7 +18229,6 @@ ssh_config_manager() {
 				read -e -p "请输入 SSH 端口（默认 $DEFAULT_SSH_PORT）: " new_port || return 1
 				new_port=${new_port:-$DEFAULT_SSH_PORT}
 				if ! validate_tcp_port "$new_port"; then echo "端口不合法"; break_end; continue; fi
-				ssh_config_backup
 				ssh_set_option Port "$new_port"
 				ssh_set_option PubkeyAuthentication yes
 				ssh_set_option AuthorizedKeysFile ".ssh/authorized_keys"
@@ -18341,15 +18238,13 @@ ssh_config_manager() {
 				ssh_set_option PermitEmptyPasswords no
 				ssh_set_option PermitRootLogin prohibit-password
 				if ! install ufw || ! ufw_allow_current_ssh "$new_port"; then
-					ssh_restore_backup
 					break_end; continue
 				fi
 				if ssh_restart_safe && ufw --force enable; then
 					[ "$new_port" = "22" ] || ufw deny 22/tcp
 					ufw status
 				else
-					ssh_restore_backup && ssh_restart_safe
-					echo "SSH 或 UFW 应用失败，已尝试恢复原 SSH 配置。"
+					echo "SSH 或 UFW 应用失败，请手动检查 $SSH_CONFIG。"
 				fi
 				;;
 			5) ssh_key_manager; continue ;;
@@ -18458,8 +18353,6 @@ fail2ban_manager() {
 		if [ ! -f "$F2B_JAIL" ]; then
 			cp /etc/fail2ban/jail.conf "$F2B_JAIL" 2>/dev/null || touch "$F2B_JAIL"
 		fi
-		cp "$F2B_JAIL" "$F2B_JAIL.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
-
 		tmp=$(mktemp)
 		awk -v port="$ports" -v logpath="$logpath" '
 			function print_sshd_block() {
@@ -19525,30 +19418,17 @@ nginx_domain_acme_conf_value() {
 }
 
 nginx_domain_migrate_existing_certs() {
-    local backup_root backup_dir conf domain alt keylength challenge_domain temp_challenge route_failed unsupported_alt cert_dir
-    local confirm backup_confirm backup_dir=""
+    local conf domain alt keylength challenge_domain temp_challenge route_failed unsupported_alt cert_dir
+    local confirm
     local success=0 failed=0 skipped=0
     local -a alt_args issue_args install_args challenge_domains temp_challenges
     [ "$(id -u)" -eq 0 ] || { echo -e "${RED}请使用 root 运行${NC}"; return 1; }
     [ -x "$ACME" ] || { echo -e "${RED}未检测到 acme.sh，请先申请或安装证书${NC}"; return 1; }
-    echo -e "${YELLOW}将备份现有配置并逐个强制重新签发可迁移证书，可能触发 CA 频率限制。${NC}"
+    echo -e "${YELLOW}将逐个强制重新签发可迁移证书，可能触发 CA 频率限制。${NC}"
     read -p "确认开始迁移？[y/N]: " confirm
     [ "$confirm" = "y" ] || [ "$confirm" = "Y" ] || { echo "已取消"; return 0; }
-    read -p "是否创建迁移备份？[y/N]: " backup_confirm
     install_nginx || return 1
     mkdir -p "$ACME_WEBROOT/.well-known/acme-challenge"
-    if [ "$backup_confirm" = "y" ] || [ "$backup_confirm" = "Y" ]; then
-        backup_root="/root/linux-daimon/backup/nginx-domain"
-        backup_dir="$backup_root/migration_$(date +%Y%m%d_%H%M%S)"
-        mkdir -p "$backup_dir"
-        cp -a /etc/nginx/sites-available "$backup_dir/" 2>/dev/null || true
-        cp -a /etc/nginx/sites-enabled "$backup_dir/" 2>/dev/null || true
-        cp -a /root/domain "$backup_dir/" 2>/dev/null || true
-        cp -a "$HOME/.acme.sh" "$backup_dir/acme.sh" 2>/dev/null || true
-        echo -e "${YELLOW}迁移备份已保存: $backup_dir${NC}"
-    else
-        echo -e "${YELLOW}已跳过迁移备份${NC}"
-    fi
 
     while IFS= read -r conf; do
         domain=$(nginx_domain_acme_conf_value "$conf" Le_Domain)
@@ -21823,6 +21703,7 @@ crontab_sync_script_file_by_id() {
 		imagebed) echo "$(crontab_sync_backup_dir)/ImageBed_CloudFlare-R2_to_OneDrive.sh" ;;
 		via) echo "$(crontab_sync_backup_dir)/Via_OneDrive_to_Kissska1.sh" ;;
 		nginxdomain) echo "$(crontab_sync_backup_dir)/Nginx_Domain_Local_Backup.sh" ;;
+		emby) echo "$(crontab_sync_backup_dir)/Emby_Root_Backup.sh" ;;
 		custom) echo "$(crontab_sync_backup_dir)/$2" ;;
 	esac
 }
@@ -21835,6 +21716,7 @@ crontab_sync_cron_line_by_id() {
 		imagebed) echo "0 4 * * * /bin/bash $script_file >> /var/log/rclone/cron_ImageBed_CloudFlare-R2_to_OneDrive.log 2>&1" ;;
 		via) echo "30 4 * * * /bin/bash $script_file >> /var/log/rclone/cron_Via_OneDrive_to_Kissska1.log 2>&1" ;;
 		nginxdomain) echo "0 5 * * * /bin/bash $script_file >> /var/log/rclone/cron_Nginx_Domain_Local_Backup.log 2>&1" ;;
+		emby) echo "0 3 * * 0 /bin/bash $script_file >> /var/log/rclone/cron_Emby_Root_Backup.log 2>&1" ;;
 		custom)
 			local script_base
 			script_base=$(basename "$script_file" .sh)
@@ -21868,10 +21750,16 @@ crontab_sync_script_content_ok() {
 				&& grep -q 'rclone_nginx_write_bundle "$TMP_DIR"' "$script_file" 2>/dev/null \
 				&& grep -q 'config-files.json' "$script_file" 2>/dev/null
 			;;
+		emby)
+			grep -q 'SRC1="/root/emby"' "$script_file" 2>/dev/null \
+				&& grep -q 'DEST="kissska1:Emby"' "$script_file" 2>/dev/null \
+				&& grep -q 'flock' "$script_file" 2>/dev/null \
+				&& grep -q 'rclone sync' "$script_file" 2>/dev/null
+			;;
 		custom)
 			grep -q 'SRC1="/root"' "$script_file" 2>/dev/null \
 				&& grep -q 'DEST1="kissska1:$SCRIPT_NAME"' "$script_file" 2>/dev/null \
-				&& grep -q 'DEST2="qq3303338052@outlook:$SCRIPT_NAME"' "$script_file" 2>/dev/null \
+				&& grep -q 'flock' "$script_file" 2>/dev/null \
 				&& grep -q 'rclone sync' "$script_file" 2>/dev/null
 			;;
 	esac
@@ -21912,6 +21800,7 @@ crontab_sync_builtin_name_by_id() {
 		imagebed) echo "图床同步脚本" ;;
 		via) echo "via同步脚本" ;;
 		nginxdomain) echo "域名和nginx配置备份脚本" ;;
+		emby) echo "Emby目录低速备份脚本" ;;
 	esac
 }
 
@@ -21921,6 +21810,7 @@ crontab_sync_builtin_id_by_number() {
 		2) echo "imagebed" ;;
 		3) echo "via" ;;
 		4) echo "nginxdomain" ;;
+		5) echo "emby" ;;
 	esac
 }
 
@@ -21935,6 +21825,7 @@ crontab_sync_custom_files() {
 		! -name 'Via_OneDrive_to_Kissska1.sh' \
 		! -name 'Via_Infini_to_OneDrive.sh' \
 		! -name 'Nginx_Domain_Local_Backup.sh' \
+		! -name 'Emby_Root_Backup.sh' \
 		-printf '%f\n' 2>/dev/null | sort
 }
 
@@ -22020,49 +21911,97 @@ EOF
 		nginxdomain)
 			rclone_nginx_write_backup_script "$script_file"
 			;;
+		emby)
+			cat > "$script_file" <<'EOF'
+#!/bin/bash
+set -Eeuo pipefail
+umask 077
+
+SRC1="/root/emby"
+DEST="kissska1:Emby"
+LOG_DIR="/var/log/rclone"
+LOG_FILE="$LOG_DIR/emby_root_backup_$(date +%F).log"
+LOCK_FILE="/run/lock/daimon-emby-root-backup.lock"
+SUCCESS_FILE="$LOG_DIR/emby_root_backup.last-success"
+
+command -v flock >/dev/null 2>&1 || { printf '%s\n' "flock 未安装" >&2; exit 1; }
+install -d -m 700 "$LOG_DIR" "$(dirname "$LOCK_FILE")"
+touch "$LOG_FILE" && chmod 600 "$LOG_FILE"
+exec 9>"$LOCK_FILE"
+flock -n 9 || { printf '%s\n' "已有 Emby 备份运行，跳过本次任务" >> "$LOG_FILE"; exit 0; }
+
+printf '===== %s 开始 Emby 目录备份 =====\n' "$(date -Is)" >> "$LOG_FILE"
+timeout 7d rclone sync "$SRC1" "$DEST" \
+  --exclude '**/logs/**' \
+  --exclude '**/*.log' \
+  --exclude '**/.migration-*/rollback/**' \
+  --transfers=1 \
+  --checkers=1 \
+  --bwlimit="${DAIMON_EMBY_BWLIMIT:-512K}" \
+  --contimeout=30s \
+  --timeout=2m \
+  --retries=3 \
+  --low-level-retries=2 \
+  --log-file="$LOG_FILE" \
+  --log-level INFO
+printf '%s\n' "$(date -Is)" > "$SUCCESS_FILE"
+chmod 600 "$SUCCESS_FILE"
+printf '===== %s Emby 目录备份完成 =====\n' "$(date -Is)" >> "$LOG_FILE"
+EOF
+			;;
 		custom)
 			cat > "$script_file" <<'EOF'
 #!/bin/bash
-set -euo pipefail
+set -Eeuo pipefail
+umask 077
 SRC1="/root"
 # 自动获取脚本文件名（不含.sh后缀）作为目标文件夹名
 
 SCRIPT_NAME=$(basename "$0" .sh)
 
 DEST1="kissska1:$SCRIPT_NAME"
-DEST2="qq3303338052@outlook:$SCRIPT_NAME"
 
 LOG_DIR="/var/log/rclone"
 LOG_FILE="$LOG_DIR/${SCRIPT_NAME}_$(date +%F).log"
-mkdir -p "$LOG_DIR"
+LOCK_FILE="/run/lock/daimon-${SCRIPT_NAME}.lock"
+SUCCESS_FILE="$LOG_DIR/${SCRIPT_NAME}.last-success"
 
-echo "===== $(date) 开始备份 =====" >> "$LOG_FILE"
+command -v flock >/dev/null 2>&1 || { printf '%s\n' "flock 未安装" >&2; exit 1; }
+install -d -m 700 "$LOG_DIR" "$(dirname "$LOCK_FILE")"
+touch "$LOG_FILE" && chmod 600 "$LOG_FILE"
+exec 9>"$LOCK_FILE"
+flock -n 9 || { printf '%s\n' "已有备份运行，跳过本次任务" >> "$LOG_FILE"; exit 0; }
 
-# Outlook
-rclone sync \
-  "$SRC1" "$DEST2" \
-  --exclude "snap/**" \
-  --exclude "/.*" \
-  --transfers=4 \
-  --checkers=8 \
-  --fast-list \
-  --progress \
-  --log-file="$LOG_FILE" \
-  --log-level INFO
+echo "===== $(date -Is) 开始备份 =====" >> "$LOG_FILE"
 
-# kissska1
+# 运行时缓存、依赖、日志、迁移回滚和 Emby 目录由专用流程处理。
 rclone sync \
   "$SRC1" "$DEST1" \
-  --exclude "snap/**" \
-  --exclude "/.*" \
-  --transfers=4 \
-  --checkers=8 \
+  --exclude '/.cache/**' \
+  --exclude '/.npm/**' \
+  --exclude '/.nvm/**' \
+  --exclude '/emby/**' \
+  --exclude '**/node_modules/**' \
+  --exclude '**/logs/**' \
+  --exclude '**/*.log' \
+  --exclude '**/.migration-*/rollback/**' \
+  --exclude '**/.tmp/**' \
+  --exclude '**/*.tmp' \
+  --exclude '**/*.temp' \
+  --transfers=2 \
+  --checkers=4 \
   --fast-list \
-  --progress \
+  --bwlimit="${DAIMON_ROOT_BWLIMIT:-512K}" \
+  --contimeout=30s \
+  --timeout=2m \
+  --retries=3 \
+  --low-level-retries=2 \
   --log-file="$LOG_FILE" \
   --log-level INFO
 
-echo "===== $(date) 备份完成 =====" >> "$LOG_FILE"
+date -Is > "$SUCCESS_FILE"
+chmod 600 "$SUCCESS_FILE"
+echo "===== $(date -Is) 备份完成 =====" >> "$LOG_FILE"
 EOF
 			;;
 		*) return 1 ;;
@@ -22162,7 +22101,7 @@ crontab_sync_install_one() {
 		return 1
 	fi
 	case "$id" in
-		bitwarden|via|custom)
+		bitwarden|via|emby|custom)
 			if ! crontab_sync_remote_ready; then
 				echo -e "${gl_hong}kissska1 连接检查失败，未修改脚本和定时任务。${gl_bai}"
 				return 1
@@ -22191,7 +22130,7 @@ crontab_sync_show_status() {
 	local file cron_line id name
 
 	echo -e "${gl_kjlan}------------------------${gl_bai}"
-	for n in 1 2 3 4; do
+	for n in 1 2 3 4 5; do
 		id=$(crontab_sync_builtin_id_by_number "$n")
 		name=$(crontab_sync_builtin_name_by_id "$id")
 		file=$(crontab_sync_script_file_by_id "$id")
@@ -22208,7 +22147,7 @@ crontab_sync_show_status() {
 			custom_count=$((custom_count + 1))
 			file="$(crontab_sync_script_file_by_id custom "$file_name")"
 			cron_line=$(crontab_sync_cron_line_by_id custom "$file")
-			printf "%2d. %-20s %-58s %b\n" "$((4 + custom_count))" "${file_name%.sh}" "$file" "$(crontab_sync_status_text custom "$file" "$cron_line")"
+			printf "%2d. %-20s %-58s %b\n" "$((5 + custom_count))" "${file_name%.sh}" "$file" "$(crontab_sync_status_text custom "$file" "$cron_line")"
 		done
 	fi
 	echo -e "${gl_kjlan}------------------------${gl_bai}"
@@ -22218,7 +22157,7 @@ crontab_sync_get_item_by_number() {
 	local num="$1"
 	local id file cron_line
 	case "$num" in
-		1|2|3|4)
+		1|2|3|4|5)
 			id=$(crontab_sync_builtin_id_by_number "$num")
 			file=$(crontab_sync_script_file_by_id "$id")
 			cron_line=$(crontab_sync_cron_line_by_id "$id" "$file")
@@ -22227,7 +22166,7 @@ crontab_sync_get_item_by_number() {
 			;;
 	esac
 
-	local custom_index=$((num - 5))
+	local custom_index=$((num - 6))
 	if [ "$custom_index" -ge 0 ]; then
 		local custom_files=()
 		mapfile -t custom_files < <(crontab_sync_custom_files)
@@ -22264,7 +22203,7 @@ crontab_sync_handle_numbers() {
 }
 
 crontab_sync_all_numbers() {
-	local count=4
+	local count=5
 	local custom_files=()
 	mapfile -t custom_files < <(crontab_sync_custom_files)
 	count=$((count + ${#custom_files[@]}))

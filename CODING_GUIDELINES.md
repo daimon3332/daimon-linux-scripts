@@ -157,6 +157,7 @@
 - crontab 同步脚本统一放到 `/root/linux-daimon/backup-sh`。
 - crontab 同步脚本日志统一放到 `/var/log/rclone`。
 - 自定义脚本名要自动补全 `.sh` 后缀。
+- 不得在普通操作前自动创建持久化 `.bak`、迁移备份或还原前备份；仅保留用户主动触发的备份流程和必要的短生命周期临时文件。
 
 ## 18. SSL / Nginx
 

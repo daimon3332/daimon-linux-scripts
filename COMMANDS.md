@@ -26,7 +26,7 @@ mkdir -p /root/linux-daimon/daimon
 - Nginx/域名菜单统一使用宿主机 Nginx + acme.sh webroot；挑战目录为 `/var/www/acme-challenge`，证书目录为 `/root/domain/<完整域名>`，证书续期会自动 reload Nginx。
 - 申请证书不会杀死未知进程，若 80 端口被占用会提示处理；域名、配置名、端口输入非法时停留在当前菜单。
 - SSH/UFW 操作会先放行现有 sshd 端口；一键 SSH 配置必须粘贴有效公钥。
-- OpenClaw 项目还原前自动生成回滚包；Docker 备份删除需确认，备份目录仅接受 `/tmp/docker_backup_*`。
+- OpenClaw 项目还原不生成还原前备份；Docker 备份删除需确认，备份目录仅接受 `/tmp/docker_backup_*`。
 
 进入主菜单主要是 `echo/read/case` 交互，不会主动修改系统。主菜单选项为：
 
@@ -1229,7 +1229,6 @@ sshd -T | awk '$1 == "pubkeyauthentication" {print $2}'
 ### 9.1 修改 SSH 端口
 
 ```bash
-cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak.$(date +%Y%m%d%H%M%S)
 sed -i 's|^[#[:space:]]*Port[[:space:]].*|Port 64400|' /etc/ssh/sshd_config
 sshd -t
 systemctl stop ssh.socket sshd.socket
@@ -1237,6 +1236,7 @@ systemctl disable ssh.socket sshd.socket
 systemctl restart sshd || systemctl restart ssh
 ufw allow 64400/tcp
 ```
+说明：脚本不会在修改前创建持久化 SSH 配置备份。
 解释：备份配置、修改端口、校验配置、重启 SSH、放行新端口。
 
 ### 9.2 禁用/开启密码登录
@@ -1396,7 +1396,7 @@ mkdir -p /var/www/acme-challenge/.well-known/acme-challenge
 ```
 解释：每天凌晨 3 点执行带锁的 webroot 续期包装脚本，日志保留在 `/var/log/acme.sh/renew.log`；失败会记录到系统日志并返回非零状态。
 
-迁移现有证书时，脚本先备份 `/root/.acme.sh`、`/root/domain` 和 Nginx 站点配置，再为每个域名加入并实际验证 challenge 路径。重新签发成功后仍安装到当前 Nginx 正在读取的证书目录，不会因为历史目录使用域名前缀而切换到错误路径；通配符、无效域名或无法安全修改的自定义配置会跳过。
+迁移现有证书时，脚本直接为每个域名加入并实际验证 challenge 路径，不创建操作前备份。重新签发成功后仍安装到当前 Nginx 正在读取的证书目录，不会因为历史目录使用域名前缀而切换到错误路径；通配符、无效域名或无法安全修改的自定义配置会跳过。
 
 配置 Nginx：
 
@@ -1748,7 +1748,15 @@ Via 同步脚本：
 cat > /root/linux-daimon/backup-sh/自定义名称.sh
 45 4 * * * /bin/bash /root/linux-daimon/backup-sh/自定义名称.sh >> /var/log/rclone/cron_自定义名称.log 2>&1
 ```
-解释：脚本名称会自动补全 `.sh` 后缀；脚本内使用文件名作为远端目录名，把 `/root` 同步到 `kissska1:脚本名` 和 `qq3303338052@outlook:脚本名`，并排除 `/root` 第一层隐藏文件/目录和 `snap/**`，子目录里的 `.env` 等隐藏文件会同步。
+解释：脚本名称会自动补全 `.sh` 后缀；脚本内使用文件名作为远端目录名，把 `/root` 低速同步到 `kissska1:脚本名`，排除 `.cache`、`.npm`、`.nvm`、`node_modules`、日志、迁移回滚、临时文件和 `/root/emby`。脚本带并发锁、失败传播和成功标记。
+
+Emby 目录低速备份脚本：
+
+```bash
+0 3 * * 0 /bin/bash /root/linux-daimon/backup-sh/Emby_Root_Backup.sh >> /var/log/rclone/cron_Emby_Root_Backup.log 2>&1
+```
+
+解释：每周日 03:00 将固定源目录 `/root/emby` 低速同步到 `kissska1:Emby`，单并发并排除日志和迁移回滚目录；不创建操作前备份。
 
 ## 18. 常用的一键脚本
 

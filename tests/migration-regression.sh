@@ -407,6 +407,29 @@ test_generated_sync_failure() {
     ! bash "$fixture/isolated.sh"
 }
 
+test_generated_backup_policies() {
+    local fixture="$WORK/policies" root_script emby_script
+    load_function crontab_sync_write_script || return 1
+    crontab_sync_log_dir() { printf '%s\n' "$fixture/logs"; }
+    mkdir -p "$fixture"
+    crontab_sync_write_script custom "$fixture/root.sh" || return 1
+    crontab_sync_write_script emby "$fixture/emby.sh" || return 1
+    root_script=$(cat "$fixture/root.sh")
+    emby_script=$(cat "$fixture/emby.sh")
+    [[ "$root_script" == *'SRC1="/root"'* ]] || return 1
+    [[ "$root_script" == *'--exclude '\''/.cache/**'\'''* ]] || return 1
+    [[ "$root_script" == *'--exclude '\''/emby/**'\'''* ]] || return 1
+    [[ "$root_script" == *'DEST1="kissska1:$SCRIPT_NAME"'* ]] || return 1
+    [[ "$root_script" != *'DEST2='* ]] || return 1
+    [[ "$root_script" == *'flock -n 9'* ]] || return 1
+    [[ "$emby_script" == *'SRC1="/root/emby"'* ]] || return 1
+    [[ "$emby_script" == *'DEST="kissska1:Emby"'* ]] || return 1
+    [[ "$emby_script" == *'--transfers=1'* ]] || return 1
+    [[ "$emby_script" == *'--bwlimit='* ]] || return 1
+    [[ "$emby_script" == *'flock -n 9'* ]] || return 1
+    ! grep -qE 'before-restore|还原前备份|是否创建迁移备份|backup_resolv_conf_once|ssh_config_backup' "$SOURCE"
+}
+
 test_remote_names_privacy() {
     local output
     rclone() { printf '{"fixture":{"type":"local","token":"PRIVATE_FIXTURE"}}\n'; }
@@ -711,7 +734,8 @@ check 'public verification remains read-only and hides URL secrets' test_verify_
 check 'rclone menu exposes only requested restore workflows' test_rclone_menu_has_only_restore_workflows
 for mode in success invalid concurrent; do check "credential transaction $mode" test_credentials_transaction "$mode"; done
 for mode in success corrupt traversal; do check "Vaultwarden archive $mode" test_vault_archive "$mode"; done
-for kind in bitwarden custom; do check "generated $kind sync propagates failure" test_generated_sync_failure "$kind"; done
+for kind in bitwarden custom emby; do check "generated $kind sync propagates failure" test_generated_sync_failure "$kind"; done
+check 'generated backup policies exclude bulky data and avoid pre-operation backups' test_generated_backup_policies
 check 'remote names and types do not expose tokens' test_remote_names_privacy
 check 'Compose labels preserve project name and override files' test_compose_context_labels
 check 'clean Compose hosts derive project name from config' test_compose_context_clean_host
