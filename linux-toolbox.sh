@@ -21889,7 +21889,16 @@ server_retire_compose_stop() {
 	local project="$1" workdir="$2" config_files="$3" config_file
 	local -a args=("-p" "$project") compose_files=()
 	root_use
-	[ -d "$workdir" ] || { echo -e "${gl_hong}项目目录不存在: $workdir${gl_bai}"; return 1; }
+	if [ ! -d "$workdir" ]; then
+		echo -e "${gl_huang}Compose 工作目录不存在，按项目标签清理容器: $workdir${gl_bai}"
+		local containers
+		containers=$(docker ps -aq --filter "label=com.docker.compose.project=$project" 2>/dev/null || true)
+		[ -n "$containers" ] || return 0
+		while IFS= read -r container; do
+			[ -n "$container" ] && docker rm -f -- "$container" || return 1
+		done <<< "$containers"
+		return 0
+	fi
 	if [ -n "$config_files" ]; then
 		IFS=',' read -r -a compose_files <<< "$config_files"
 		for config_file in "${compose_files[@]}"; do
@@ -22008,14 +22017,16 @@ server_retire_remove_script() {
 	while IFS= read -r dir; do
 		case "$real" in "$(realpath -m -- "$dir")"/*) allowed=true ;; esac
 	done < <(server_retire_sync_dirs; server_retire_update_dirs)
-	case "$real" in "$(realpath -m -- "$DAIMON_SCRIPT_DIR")/auto_cert_renewal.sh") allowed=true ;; esac
+	case "$real" in
+		"$(realpath -m -- "$DAIMON_SCRIPT_DIR")/auto_cert_renewal.sh"|"$(realpath -m -- "$DAIMON_ROOT_DIR")/cert-renew.sh") allowed=true ;;
+	esac
 	$allowed || { echo -e "${gl_hong}跳过非托管脚本: $file${gl_bai}"; return 1; }
 	server_retire_remove_cron_path "$file" || return 1
 	rm -f -- "$file"
 }
 
 server_retire_show_status() {
-	local count=0 running project workdir config_files file domains enabled cron_state active=0 cert_file
+	local count=0 running project workdir config_files file domains enabled cron_state active=0 cert_file legacy_cert_file cert_cron=false
 	echo "服务器退役状态（只读检测，不会自动删除）"
 	echo "------------------------"
 	while IFS=$'\t' read -r project workdir config_files; do
@@ -22034,11 +22045,13 @@ server_retire_show_status() {
 	while IFS=$'\t' read -r file cron_state; do count=$((count + 1)); done < <(server_retire_update_items)
 	echo "自动同步脚本：$active 个，Compose 自动更新脚本：$count 个"
 	cert_file="$DAIMON_SCRIPT_DIR/auto_cert_renewal.sh"
-	if [ -f "$cert_file" ] && printf '%s\n' "$(crontab -l 2>/dev/null || true)" | awk -v path="$cert_file" '/^[[:space:]]*#/ {next} {p=" " $0 " "; if (index(p, " " path " ")) found=1} END {exit !found}'; then
+	legacy_cert_file="$DAIMON_ROOT_DIR/cert-renew.sh"
+	if printf '%s\n' "$(crontab -l 2>/dev/null || true)" | awk -v path="$cert_file" -v legacy="$legacy_cert_file" '/^[[:space:]]*#/ {next} {p=" " $0 " "; if (index(p, " " path " ") || index(p, " " legacy " ")) found=1} END {exit !found}'; then cert_cron=true; fi
+	if { [ -f "$cert_file" ] || [ -f "$legacy_cert_file" ]; } && $cert_cron; then
 		echo "证书自动续期：已配置"
-	elif [ -f "$cert_file" ]; then
+	elif [ -f "$cert_file" ] || [ -f "$legacy_cert_file" ]; then
 		echo "证书自动续期：脚本存在，未加入定时"
-	elif printf '%s\n' "$(crontab -l 2>/dev/null || true)" | awk -v path="$cert_file" '/^[[:space:]]*#/ {next} {p=" " $0 " "; if (index(p, " " path " ")) found=1} END {exit !found}'; then
+	elif $cert_cron; then
 		echo "证书自动续期：定时存在，脚本不存在"
 	else
 		echo "证书自动续期：未检测到"
@@ -22053,7 +22066,7 @@ server_retire_all_numbers() {
 	n=0; while IFS= read -r line; do [ -n "$line" ] && n=$((n + 1)) && printf 'N%s ' "$n"; done < <(server_retire_nginx_items)
 	n=0; while IFS= read -r line; do [ -n "$line" ] && n=$((n + 1)) && printf 'A%s ' "$n"; done < <(server_retire_script_items)
 	n=0; while IFS= read -r line; do [ -n "$line" ] && n=$((n + 1)) && printf 'U%s ' "$n"; done < <(server_retire_update_items)
-	if printf '%s\n' "$(crontab -l 2>/dev/null || true)" | awk -v path="$DAIMON_SCRIPT_DIR/auto_cert_renewal.sh" '/^[[:space:]]*#/ {next} {p=" " $0 " "; if (index(p, " " path " ")) found=1} END {exit !found}'; then printf 'R1 '; fi
+	if [ -f "$DAIMON_SCRIPT_DIR/auto_cert_renewal.sh" ] || [ -f "$DAIMON_ROOT_DIR/cert-renew.sh" ] || printf '%s\n' "$(crontab -l 2>/dev/null || true)" | awk -v path="$DAIMON_SCRIPT_DIR/auto_cert_renewal.sh" -v legacy="$DAIMON_ROOT_DIR/cert-renew.sh" '/^[[:space:]]*#/ {next} {p=" " $0 " "; if (index(p, " " path " ") || index(p, " " legacy " ")) found=1} END {exit !found}'; then printf 'R1 '; fi
 }
 
 server_retire_apply_token() {
@@ -22063,7 +22076,10 @@ server_retire_apply_token() {
 		N[0-9]*) n="${token#N}"; item=$(server_retire_nginx_item "$n") || return 1; IFS=$'\t' read -r file domains enabled <<< "$item"; server_retire_nginx_remove "$file" "$domains" ;;
 		A[0-9]*) n="${token#A}"; file=$(server_retire_script_items | sed -n "${n}p" | cut -f1); [ -n "$file" ] || return 1; server_retire_remove_script "$file" ;;
 		U[0-9]*) n="${token#U}"; file=$(server_retire_update_items | sed -n "${n}p" | cut -f1); [ -n "$file" ] || return 1; server_retire_remove_script "$file" ;;
-		R1) server_retire_remove_script "$DAIMON_SCRIPT_DIR/auto_cert_renewal.sh" ;;
+		R1)
+			server_retire_remove_script "$DAIMON_SCRIPT_DIR/auto_cert_renewal.sh" 2>/dev/null || true
+			server_retire_remove_script "$DAIMON_ROOT_DIR/cert-renew.sh"
+			;;
 		*) return 1 ;;
 	esac
 }
@@ -22133,9 +22149,12 @@ server_retire_script_menu() {
 }
 
 server_retire_cert_menu() {
-	if [ -f "$DAIMON_SCRIPT_DIR/auto_cert_renewal.sh" ]; then
+	if [ -f "$DAIMON_SCRIPT_DIR/auto_cert_renewal.sh" ] || [ -f "$DAIMON_ROOT_DIR/cert-renew.sh" ]; then
 		read -r -p "删除证书自动续期脚本和定时任务？(y/N): " confirm || return 1
-		[[ "$confirm" =~ ^[Yy]$ ]] && server_retire_remove_script "$DAIMON_SCRIPT_DIR/auto_cert_renewal.sh"
+		if [[ "$confirm" =~ ^[Yy]$ ]]; then
+			server_retire_remove_script "$DAIMON_SCRIPT_DIR/auto_cert_renewal.sh" 2>/dev/null || true
+			server_retire_remove_script "$DAIMON_ROOT_DIR/cert-renew.sh"
+		fi
 	else
 		echo "未检测到证书自动续期脚本。"
 	fi
