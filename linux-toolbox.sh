@@ -20079,19 +20079,6 @@ finally:
 PY
 )
 
-rclone_restore_history() {
-	local file="${DAIMON_RESTORE_ROOT:-/root}/linux-daimon/restore-status.json"
-	[ -f "$file" ] || { echo "暂无本脚本记录的恢复结果；不代表数据缺失。"; return 0; }
-	echo "历史恢复结果（非实时业务状态）："
-	python3 - "$file" <<'PY'
-import json,sys
-from pathlib import Path
-for entry in json.loads(Path(sys.argv[1]).read_text()):
-    fields=[str(entry.get(k,"")) for k in ("time","stage","target","status","detail")]
-    print(" | ".join("".join(c for c in s if ord(c)>=32 and ord(c)!=127) for s in fields))
-PY
-}
-
 rclone_restore_folder() (
 	umask 077
 	set -o pipefail
@@ -21366,9 +21353,6 @@ rclone_manager() {
 		echo -e "${gl_kjlan}4.   ${gl_bai}恢复远程文件夹到 /root"
 		echo -e "${gl_kjlan}5.   ${gl_bai}从远程恢复 Nginx + 域名"
 		echo -e "${gl_kjlan}6.   ${gl_bai}Docker Compose 恢复"
-		echo -e "${gl_kjlan}7.   ${gl_bai}Docker named volume 清单/恢复"
-		echo -e "${gl_kjlan}8.   ${gl_bai}恢复后 DNS/HTTPS 只读验证"
-		echo -e "${gl_kjlan}9.   ${gl_bai}查看恢复记录"
 		echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
 		echo -e "${gl_kjlan}------------------------${gl_bai}"
 		read -e -p "请输入你的选择: " sub_choice || return 1
@@ -21379,9 +21363,6 @@ rclone_manager() {
 			4) rclone_restore_remote_folder ;;
 			5) rclone_restore_nginx_domain_remote ;;
 			6) rclone_restore_docker_compose_projects ;;
-			7) rclone_restore_named_volumes ;;
-			8) rclone_migration_verify ;;
-			9) rclone_restore_history ;;
 			0) return ;;
 			*) echo "无效的输入!" ;;
 		esac

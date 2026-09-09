@@ -1612,22 +1612,6 @@ rclone_restore_nginx_domain_remote
 ```
 解释：从所选 remote 的服务器目录读取 `linux-daimon/backup/nginx-domain/auto_latest`，下载和内容验证后才应用。支持保留或替换同名文件，恢复站点、证书、`conf.d`、`stream.d`、`nginx.conf` 和存在的 `/home/web` include 目录，并用 `nginx -T` 清单核对实际加载文件。缺少 `enabled_sites.txt` 或 include、模块和证书不匹配时拒绝启动并回滚。Nginx/OpenSSL/UFW 缺失时自动安装；保护检测到的 SSH 端口，放行 80/443 和 `172.16.0.0/12`，再启用并复核 UFW。不会修改 DNS；云安全组、证书续期和公网域名仍需核对。
 
-Docker named volume 清单/恢复：
-
-```bash
-rclone_restore_named_volumes
-```
-解释：可查看本机 volume、执行一次性导出或从 `linux-daimon/backup/docker-volumes/<volume>` 恢复。导出和恢复均要求停止使用该卷的容器；归档保存 UID/GID 和权限，恢复前进行 SHA-256、tar 路径和普通文件校验，再原子替换目标卷。不会创建定时备份，不覆盖已有远程归档，不把 named volume 改写为 `./data`；Vaultwarden 仍使用 Bitwarden 专用还原。
-
-恢复后 DNS/HTTPS 只读验证：
-
-```bash
-rclone_migration_verify
-```
-解释：读取 `nginx -T` 中的域名，用户可输入新服务器 IPv4 用 `curl --resolve` 做不改 DNS 的 TLS/HTTP 验证，或留空仅查询当前 DNS；可追加业务健康 URL。只记录状态码和结果，不打印 URL 中的凭据，不修改 DNS。
-
-`rclone_restore_history` 展示 `/root/linux-daimon/restore-status.json` 中的历史阶段结果，包含已恢复、待启动、运行和失败，不存储 token、密码或 Compose 环境变量。公网验证仅输出检查结果，不写配置，也不代表业务登录已验证。
-
 命令行入口：
 
 ```bash

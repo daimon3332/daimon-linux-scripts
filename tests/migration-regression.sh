@@ -320,6 +320,17 @@ test_verify_is_readonly_and_private() {
     [[ "$output" != *PRIVATE_FIXTURE* && "$output" != *UNEXPECTED_WRITE* ]] && grep -q -- '--resolve fixture.example:443:192.0.2.1' "$log"
 }
 
+test_rclone_menu_has_only_restore_workflows() {
+    local output
+    output=$(rclone_manager <<< 0) || return 1
+    [[ "$output" == *'1.   安装 rclone'* ]] &&
+        [[ "$output" == *'6.   Docker Compose 恢复'* ]] &&
+        [[ "$output" == *'0.   返回主菜单'* ]] &&
+        [[ "$output" != *'Docker named volume 清单/恢复'* ]] &&
+        [[ "$output" != *'恢复后 DNS/HTTPS 只读验证'* ]] &&
+        [[ "$output" != *'查看恢复记录'* ]]
+}
+
 test_credentials_transaction() {
     local mode="$1" fixture="$WORK/credentials-$1" output rc=0
     local fixture_target="$fixture/volume/rclone/rclone.conf"
@@ -697,6 +708,7 @@ check 'Compose accepts null IPAM config when validating a host proxy' test_compo
 check 'failed Compose status query cannot become startup' test_compose_failed_ps_caller
 for mode in missing existing plugin failure; do check "Compose dependency $mode" test_compose_prepare_dependencies "$mode"; done
 check 'public verification remains read-only and hides URL secrets' test_verify_is_readonly_and_private
+check 'rclone menu exposes only requested restore workflows' test_rclone_menu_has_only_restore_workflows
 for mode in success invalid concurrent; do check "credential transaction $mode" test_credentials_transaction "$mode"; done
 for mode in success corrupt traversal; do check "Vaultwarden archive $mode" test_vault_archive "$mode"; done
 for kind in bitwarden custom; do check "generated $kind sync propagates failure" test_generated_sync_failure "$kind"; done
