@@ -1594,7 +1594,7 @@ rm -f /usr/bin/rclone /usr/local/bin/rclone
 ```bash
 rclone_restore_remote_folder
 ```
-解释：先选择通过验证的 remote 和服务器，再多选子目录，支持 `1 2 3`、`1,2,3`、`all` 及十进制 `08`。目录名使用 JSON 解析，保留连续空格。检查真实目标路径、Docker 活跃挂载和暂存空间；下载到独立目录并通过 `rclone check --download` 比较内容，再按用户选择保留或覆盖同名文件，替换失败回滚。根层文件、隐藏配置缺项、外部 binds、volumes、系统 cron 以及原 UID/GID 需单独核对。
+解释：先选择通过验证的 remote 和服务器，再多选子目录，支持 `1 2 3`、`1,2,3`、`all` 及十进制 `08`。目录名使用 JSON 解析，保留连续空格。恢复前展示根层文件清单，下载到独立目录并通过 `rclone check --download` 比较内容，再按用户选择保留或覆盖同名文件，替换失败回滚。此处仍是选择性恢复：根层文件、隐藏配置缺项、外部 binds、named volumes、系统 cron、Mihomo 和 DNS 需按各自流程处理。
 
 Docker Compose 恢复：
 
@@ -1603,14 +1603,30 @@ rclone_restore_docker_compose_projects
 # Approved project startup uses:
 docker compose up -d --no-recreate --no-build --pull missing --wait --wait-timeout 120
 ```
-解释：扫描 `/root` 及最多三级子目录的 `compose.yaml`、`compose.yml`、`docker-compose.yaml`、`docker-compose.yml`，排除隐藏、数据、备份和审计目录。现有项目从容器 labels 复用名称及多配置文件参数；歧义或文件缺失时停止。缺少 bind source、named volume 或代理错误会阻止启动；不会静默创建空数据卷。状态查询失败不会变成启动操作，已运行但 unhealthy 的服务单独报错；有效的已完成初始化依赖不要求持续运行。启动有 120 秒健康等待，无 healthcheck 只能确认运行状态。代理通过实际容器网络命名空间验证 TCP，不打印 URL 凭据；必要 UFW 规则按实际网段和端口单独确认。不会修改业务 YAML、安装 Mihomo、切换 DNS 或自动安装迁移来的 cron。
+解释：缺少 Docker/Compose 时调用现有安装流程；扫描 `/root` 及最多五级子目录的常见 Compose 文件，排除隐藏、数据、备份和审计目录，并允许追加绝对目录。现有项目从容器 labels 复用名称及多配置文件参数；无旧容器时从 `name:` 或目录名推导项目名，必要时可手动指定配置、`.env` 和项目名。缺少 bind source、named volume 或代理错误会阻止启动；不会静默创建空数据卷。状态查询失败不会变成启动操作，已运行但 unhealthy 的服务单独报错；有效的已完成初始化依赖不要求持续运行。启动有 120 秒健康等待，无 healthcheck 只能确认运行状态。代理通过实际容器网络命名空间验证 TCP，不打印 URL 凭据；必要规则由 Nginx/域名恢复阶段统一处理。不会修改业务 YAML、安装 Mihomo、切换 DNS 或自动安装迁移来的 cron。
 
 从远程恢复 Nginx + 域名：
 
 ```bash
 rclone_restore_nginx_domain_remote
 ```
-解释：从所选 remote 的服务器目录读取 `linux-daimon/backup/nginx-domain/auto_latest`，下载和内容验证后才应用。支持保留或替换同名文件，已有证书目录也会补齐缺失文件，并检查有效期和私钥配对。没有 `enabled_sites.txt` 时拒绝猜测启用列表。缺少 include、模块或其他文件会在 `nginx -t` 阶段失败并回滚，失败不会覆盖源备份；本地恢复共用同一逻辑。Nginx/openssl 缺失时通过 apt 安装；UFW 已启用才开放 80/443，不强制启用 UFW。服务启动、重载、状态或自启配置失败均报告失败。证书续期环境和云安全组仍需核对。
+解释：从所选 remote 的服务器目录读取 `linux-daimon/backup/nginx-domain/auto_latest`，下载和内容验证后才应用。支持保留或替换同名文件，恢复站点、证书、`conf.d`、`stream.d`、`nginx.conf` 和存在的 `/home/web` include 目录，并用 `nginx -T` 清单核对实际加载文件。缺少 `enabled_sites.txt` 或 include、模块和证书不匹配时拒绝启动并回滚。Nginx/OpenSSL/UFW 缺失时自动安装；保护检测到的 SSH 端口，放行 80/443 和 `172.16.0.0/12`，再启用并复核 UFW。不会修改 DNS；云安全组、证书续期和公网域名仍需核对。
+
+Docker named volume 清单/恢复：
+
+```bash
+rclone_restore_named_volumes
+```
+解释：可查看本机 volume、执行一次性导出或从 `linux-daimon/backup/docker-volumes/<volume>` 恢复。导出和恢复均要求停止使用该卷的容器；归档保存 UID/GID 和权限，恢复前进行 SHA-256、tar 路径和普通文件校验，再原子替换目标卷。不会创建定时备份，不覆盖已有远程归档，不把 named volume 改写为 `./data`；Vaultwarden 仍使用 Bitwarden 专用还原。
+
+恢复后 DNS/HTTPS 只读验证：
+
+```bash
+rclone_migration_verify
+```
+解释：读取 `nginx -T` 中的域名，用户可输入新服务器 IPv4 用 `curl --resolve` 做不改 DNS 的 TLS/HTTP 验证，或留空仅查询当前 DNS；可追加业务健康 URL。只记录状态码和结果，不打印 URL 中的凭据，不修改 DNS。
+
+`rclone_restore_history` 展示 `/root/linux-daimon/restore-status.json` 中的历史阶段结果，包含已恢复、待启动、运行和失败，不存储 token、密码或 Compose 环境变量。公网验证仅输出检查结果，不写配置，也不代表业务登录已验证。
 
 命令行入口：
 

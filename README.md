@@ -287,13 +287,16 @@ Compose 自动更新不会预先执行 `docker compose down`。每个任务使�
 | 1 | 安装 rclone | 安装 rclone |
 | 2 | 修改配置文件 | 打开 rclone 配置 |
 | 3 | 卸载 rclone | 卸载 rclone |
-| 4 | 恢复远程文件夹到 /root | 选择有效 remote、服务器和子目录；暂存、内容校验后合并，拒绝活跃挂载和符号链接，明确选择同名文件策略 |
-| 5 | 从远程恢复 Nginx + 域名 | 补齐安装、站点与证书，按清单建链接并验证密钥配对、有效期和服务状态；失败回滚，不切换 DNS |
-| 6 | Docker Compose 恢复 | 受限扫描常见 Compose 文件名，复用现有项目参数；检查挂载和代理，确认后启动并等待健康，不重建已运行容器 |
+| 4 | 恢复远程文件夹到 /root | 选择有效 remote、服务器和子目录；暂存、内容校验后合并，拒绝活跃挂载和符号链接，明确选择同名文件策略；根层文件、Mihomo、DNS、cron 仍由用户处理 |
+| 5 | 从远程恢复 Nginx + 域名 | 缺失时自动安装 Nginx、OpenSSL、UFW，保护实际 SSH 端口并放行 80/443 与 `172.16.0.0/12`；恢复站点、证书、实际 include 清单并验证，失败回滚，不切换 DNS |
+| 6 | Docker Compose 恢复 | 缺失时调用现有 Docker/Compose 安装流程；扫描最多五级常见 Compose 文件，支持追加绝对目录，检查挂载、卷和代理，确认后启动并等待健康，不重建已运行容器 |
+| 7 | Docker named volume 清单/恢复 | 查看 volume、执行一次性归档导出或从已校验归档恢复；恢复前必须停止容器，保留 named volume 和原 UID/GID，不把卷改成 `./data`；Vaultwarden 使用专用还原 |
+| 8 | 恢复后 DNS/HTTPS 只读验证 | 读取 Nginx 域名，查询 DNS 或指定新服务器 IPv4 验证 TLS/HTTP；可追加业务健康 URL，不修改 DNS |
+| 9 | 查看恢复记录 | 查看目录、Nginx、Compose、volume 各阶段的历史结果；记录不包含凭据，不作为实时业务健康结论 |
 
 进入管理菜单会在隔离配置副本中实际检测每个 remote，显示名称、类型及有效／认证无效／无法检测；不打印 token，读取成功不等于已验证备份可写。需要 Python 3，单个 remote 检测最多 25 秒。
 
-迁移顺序：用户安装 Mihomo；脚本恢复目录与 Nginx/证书、检查数据挂载并启动 Compose；用户切换 DNS，再验证域名和登录。目录恢复不包含根层文件、未备份的隐藏配置、`/data`、named volumes 或系统 cron，也不保证云文件保留原 UID/GID。缺项必须先补齐，不能将容器运行视为整机恢复完成。Nginx 恢复仅在已启用的 UFW 中开放 80/443；代理受阻时可确认按实际 Docker 网段和必要端口添加规则，不全网段全端口放行。
+迁移顺序：用户安装 Mihomo；脚本通过 rclone 菜单选择性恢复 `/root`，再恢复 Nginx/证书（自动补齐 Nginx、OpenSSL、UFW，保护 SSH，放行 80/443 和用户指定的 `172.16.0.0/12`），检查卷/挂载并启动 Compose；用户切换 DNS，再验证域名和登录。目录恢复不包含根层文件、未备份的隐藏配置、`/data`、named volumes 或系统 cron，也不保证云文件保留原 UID/GID。named volume 必须通过独立归档入口恢复，不能把容器运行视为整机恢复完成。脚本不安装 Mihomo、不修改 DNS，也不恢复系统 cron；业务登录、DNS 和公网 HTTPS 仍需人工或恢复后的验证菜单核对。
 
 ### Bitwarden管理
 
