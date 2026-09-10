@@ -18487,7 +18487,7 @@ ssl_nginx_manager() {
 	declare -f install ssh_current_ports rclone_restore_name_valid rclone_tree_safe rclone_assert_inactive rclone_require_space \
 		rclone_nginx_prepare rclone_nginx_allow_ports rclone_nginx_cert_valid rclone_nginx_apply \
 		rclone_nginx_target_for_key rclone_nginx_loaded_files rclone_nginx_check_manifest \
-		rclone_nginx_write_bundle rclone_nginx_write_backup_script rclone_check_nginx_after_restore || return 1
+		rclone_nginx_write_bundle rclone_nginx_write_backup_script rclone_check_nginx_after_restore crontab_sync_cron_entry || return 1
 	cat <<'DAIMON_CERT_NGINX_SCRIPT' || return 1
 #!/bin/bash
 set -e
@@ -19143,7 +19143,7 @@ nginx_domain_auto_backup_script() {
 }
 
 nginx_domain_auto_backup_cron_line() {
-    echo "0 5 * * * /bin/bash $(nginx_domain_auto_backup_script) >> /var/log/rclone/cron_Nginx_Domain_Local_Backup.log 2>&1"
+    crontab_sync_cron_entry "0 4 * * * /bin/bash $(nginx_domain_auto_backup_script) >> /var/log/rclone/cron_Nginx_Domain_Local_Backup.log 2>&1"
 }
 
 nginx_domain_has_domains() {
@@ -21301,7 +21301,7 @@ bitwarden_sync_script_file() {
 }
 
 bitwarden_sync_cron_line() {
-	echo "0 6 * * * /bin/bash $(bitwarden_sync_script_file) >> /var/log/rclone/cron_Vaultwarden_OneDrive_to_Kissska1.log 2>&1"
+	crontab_sync_cron_entry "5 5 * * * /bin/bash $(bitwarden_sync_script_file) >> /var/log/rclone/cron_Vaultwarden_OneDrive_to_Kissska1.log 2>&1"
 }
 
 bitwarden_rclone_config_status() {
@@ -21683,6 +21683,25 @@ crontab_sync_target_remote() {
 	echo "kissska1"
 }
 
+crontab_sync_timezone() {
+	echo "Asia/Shanghai"
+}
+
+crontab_sync_cron_entry() {
+	local minute hour day month weekday command
+	read -r minute hour day month weekday command <<< "$1"
+	[[ "$minute" =~ ^[0-9]{1,2}$ && "$hour" =~ ^[0-9]{1,2}$ ]] || return 1
+	((10#$minute < 60 && 10#$hour < 24)) || return 1
+	[ "$day:$month" = '*:*' ] && [[ "$weekday" =~ ^(\*|[0-7])$ ]] || return 1
+	local clock
+	printf -v clock '%02d:%02d' "$((10#$hour))" "$((10#$minute))"
+	printf '* * * * * [ "$(TZ=Asia/Shanghai date +\%%H:\%%M)" = "%s" ]' "$clock"
+	if [ "$weekday" != '*' ]; then
+		printf ' && [ "$(TZ=Asia/Shanghai date +\%%w)" = "%s" ]' "$((weekday % 7))"
+	fi
+	printf ' && %s\n' "$command"
+}
+
 crontab_sync_remote_ready() {
 	local remote
 	remote=$(crontab_sync_target_remote)
@@ -21703,6 +21722,7 @@ crontab_sync_script_file_by_id() {
 		imagebed) echo "$(crontab_sync_backup_dir)/ImageBed_CloudFlare-R2_to_OneDrive.sh" ;;
 		via) echo "$(crontab_sync_backup_dir)/Via_OneDrive_to_Kissska1.sh" ;;
 		nginxdomain) echo "$(crontab_sync_backup_dir)/Nginx_Domain_Local_Backup.sh" ;;
+		root) echo "$(crontab_sync_backup_dir)/Root_Backup.sh" ;;
 		emby) echo "$(crontab_sync_backup_dir)/Emby_Root_Backup.sh" ;;
 		custom) echo "$(crontab_sync_backup_dir)/$2" ;;
 	esac
@@ -21711,18 +21731,21 @@ crontab_sync_script_file_by_id() {
 crontab_sync_cron_line_by_id() {
 	local id="$1"
 	local script_file="$2"
-	case "$id" in
-		bitwarden) echo "0 6 * * * /bin/bash $script_file >> /var/log/rclone/cron_Vaultwarden_OneDrive_to_Kissska1.log 2>&1" ;;
-		imagebed) echo "0 4 * * * /bin/bash $script_file >> /var/log/rclone/cron_ImageBed_CloudFlare-R2_to_OneDrive.log 2>&1" ;;
-		via) echo "30 4 * * * /bin/bash $script_file >> /var/log/rclone/cron_Via_OneDrive_to_Kissska1.log 2>&1" ;;
-		nginxdomain) echo "0 5 * * * /bin/bash $script_file >> /var/log/rclone/cron_Nginx_Domain_Local_Backup.log 2>&1" ;;
-		emby) echo "0 3 * * 0 /bin/bash $script_file >> /var/log/rclone/cron_Emby_Root_Backup.log 2>&1" ;;
+	local line
+	line=$(case "$id" in
+		bitwarden) echo "5 5 * * * /bin/bash $script_file >> /var/log/rclone/cron_Vaultwarden_OneDrive_to_Kissska1.log 2>&1" ;;
+		imagebed) echo "10 4 * * * /bin/bash $script_file >> /var/log/rclone/cron_ImageBed_CloudFlare-R2_to_OneDrive.log 2>&1" ;;
+		via) echo "15 4 * * * /bin/bash $script_file >> /var/log/rclone/cron_Via_OneDrive_to_Kissska1.log 2>&1" ;;
+		nginxdomain) echo "0 4 * * * /bin/bash $script_file >> /var/log/rclone/cron_Nginx_Domain_Local_Backup.log 2>&1" ;;
+		root) echo "25 4 * * * /bin/bash $script_file >> /var/log/rclone/cron_Root_Backup.log 2>&1" ;;
+		emby) echo "45 5 * * 0 /bin/bash $script_file >> /var/log/rclone/cron_Emby_Root_Backup.log 2>&1" ;;
 		custom)
 			local script_base
 			script_base=$(basename "$script_file" .sh)
 			echo "45 4 * * * /bin/bash $script_file >> /var/log/rclone/cron_${script_base}.log 2>&1"
 			;;
-	esac
+	esac) || return 1
+	crontab_sync_cron_entry "$line"
 }
 
 crontab_sync_script_content_ok() {
@@ -21750,6 +21773,14 @@ crontab_sync_script_content_ok() {
 				&& grep -q 'rclone_nginx_write_bundle "$TMP_DIR"' "$script_file" 2>/dev/null \
 				&& grep -q 'config-files.json' "$script_file" 2>/dev/null
 			;;
+		root)
+			grep -q 'SRC1="/root"' "$script_file" 2>/dev/null \
+				&& grep -q 'DEST1="kissska1:Root_Backup"' "$script_file" 2>/dev/null \
+				&& grep -q 'docker stop' "$script_file" 2>/dev/null \
+				&& grep -q 'docker start' "$script_file" 2>/dev/null \
+				&& grep -q 'flock -x' "$script_file" 2>/dev/null \
+				&& grep -q 'last-success' "$script_file" 2>/dev/null
+			;;
 		emby)
 			grep -q 'SRC1="/root/emby"' "$script_file" 2>/dev/null \
 				&& grep -q 'DEST="kissska1:Emby"' "$script_file" 2>/dev/null \
@@ -21776,7 +21807,7 @@ crontab_sync_status_text() {
 
 	[ -f "$script_file" ] && has_file=true
 	cron_output=$(crontab -l 2>/dev/null || true)
-	if echo "$cron_output" | grep -Fxq "$cron_line" || echo "$cron_output" | grep -Fq "$script_file"; then
+	if echo "$cron_output" | grep -Fxq "$cron_line"; then
 		has_cron=true
 	fi
 	crontab_sync_script_content_ok "$id" "$script_file" && content_ok=true
@@ -21800,6 +21831,7 @@ crontab_sync_builtin_name_by_id() {
 		imagebed) echo "图床同步脚本" ;;
 		via) echo "via同步脚本" ;;
 		nginxdomain) echo "域名和nginx配置备份脚本" ;;
+		root) echo "/root Docker一致性备份脚本" ;;
 		emby) echo "Emby目录低速备份脚本" ;;
 	esac
 }
@@ -21811,6 +21843,7 @@ crontab_sync_builtin_id_by_number() {
 		3) echo "via" ;;
 		4) echo "nginxdomain" ;;
 		5) echo "emby" ;;
+		6) echo "root" ;;
 	esac
 }
 
@@ -21825,6 +21858,7 @@ crontab_sync_custom_files() {
 		! -name 'Via_OneDrive_to_Kissska1.sh' \
 		! -name 'Via_Infini_to_OneDrive.sh' \
 		! -name 'Nginx_Domain_Local_Backup.sh' \
+		! -name 'Root_Backup.sh' \
 		! -name 'Emby_Root_Backup.sh' \
 		-printf '%f\n' 2>/dev/null | sort
 }
@@ -21849,8 +21883,11 @@ DEST_REMOTE="kissska1:/BitwardenBackup"
 # ========= 日志 =========
 LOG_DIR="/var/log/rclone"
 LOG_FILE="$LOG_DIR/vaultwarden_backup_sync_$(date +%F).log"
+LOCK_FILE="/run/lock/daimon-rclone-backups.lock"
 
-mkdir -p "$LOG_DIR"
+install -d -m 700 "$LOG_DIR" "$(dirname "$LOCK_FILE")"
+exec 9>"$LOCK_FILE"
+flock -x 9
 
 echo "===== $(date) 开始同步 Vaultwarden 备份（sync） =====" >> "$LOG_FILE"
 
@@ -21874,8 +21911,11 @@ set -euo pipefail
 
 LOG_DIR="/var/log/rclone"
 LOG_FILE="$LOG_DIR/r2_to_onedrive_imagebed.log"
+LOCK_FILE="/run/lock/daimon-rclone-backups.lock"
 
-mkdir -p "$LOG_DIR"
+install -d -m 700 "$LOG_DIR" "$(dirname "$LOCK_FILE")"
+exec 9>"$LOCK_FILE"
+flock -x 9
 
 rclone sync \
   qq3303338052@cloudflare:image-bed-daimon \
@@ -21895,8 +21935,11 @@ set -euo pipefail
 
 LOG_DIR="/var/log/rclone"
 LOG_FILE="$LOG_DIR/outlook_to_kissska1_via.log"
+LOCK_FILE="/run/lock/daimon-rclone-backups.lock"
 
-mkdir -p "$LOG_DIR"
+install -d -m 700 "$LOG_DIR" "$(dirname "$LOCK_FILE")"
+exec 9>"$LOCK_FILE"
+flock -x 9
 
 rclone sync \
   "qq3303338052@outlook:Via" \
@@ -21911,6 +21954,101 @@ EOF
 		nginxdomain)
 			rclone_nginx_write_backup_script "$script_file"
 			;;
+		root)
+			cat > "$script_file" <<'EOF'
+#!/bin/bash
+set -Eeuo pipefail
+umask 077
+
+SRC1="/root"
+DEST1="kissska1:Root_Backup"
+LOG_DIR="/var/log/rclone"
+LOG_FILE="$LOG_DIR/Root_Backup_$(date +%F).log"
+LOCAL_LOCK_FILE="/run/lock/daimon-Root_Backup.lock"
+GLOBAL_LOCK_FILE="/run/lock/daimon-rclone-backups.lock"
+SUCCESS_FILE="$LOG_DIR/Root_Backup.last-success"
+CONTAINER_STATE_FILE=""
+BACKUP_OK=0
+
+command -v rclone >/dev/null 2>&1 || { printf '%s\n' "rclone 未安装" >&2; exit 1; }
+command -v flock >/dev/null 2>&1 || { printf '%s\n' "flock 未安装" >&2; exit 1; }
+install -d -m 700 "$LOG_DIR" "$(dirname "$LOCAL_LOCK_FILE")"
+touch "$LOG_FILE" && chmod 600 "$LOG_FILE"
+exec 9>"$LOCAL_LOCK_FILE"
+flock -n 9 || { printf '%s\n' "已有 /root 备份运行，跳过本次任务" >> "$LOG_FILE"; exit 0; }
+exec 8>"$GLOBAL_LOCK_FILE"
+flock -x 8
+
+restore_containers() {
+    local rc=$? id restart_failed=0
+    trap - EXIT INT TERM
+    set +e
+    if [ -n "$CONTAINER_STATE_FILE" ] && [ -s "$CONTAINER_STATE_FILE" ]; then
+        while IFS= read -r id; do
+            [ -n "$id" ] || continue
+            [ "$(docker inspect -f '{{.State.Running}}' "$id" 2>/dev/null || true)" = true ] && continue
+            if ! docker start "$id" >/dev/null 2>&1; then
+                printf '%s\n' "容器恢复启动失败: $id" >> "$LOG_FILE"
+                restart_failed=1
+            fi
+        done < "$CONTAINER_STATE_FILE"
+    fi
+    [ -z "$CONTAINER_STATE_FILE" ] || rm -f -- "$CONTAINER_STATE_FILE"
+    if [ "$restart_failed" -ne 0 ] || [ "$BACKUP_OK" -ne 1 ]; then
+        rc=1
+    else
+        date -Is > "$SUCCESS_FILE"
+        chmod 600 "$SUCCESS_FILE"
+        printf '===== %s /root 备份完成 =====\n' "$(date -Is)" >> "$LOG_FILE"
+    fi
+    exit "$rc"
+}
+trap restore_containers EXIT INT TERM
+
+rm -f -- "$SUCCESS_FILE"
+printf '===== %s 开始 /root 一致性备份 =====\n' "$(date -Is)" >> "$LOG_FILE"
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    CONTAINER_STATE_FILE=$(mktemp /run/lock/daimon-root-containers.XXXXXX)
+    while IFS= read -r id; do
+        [ -n "$id" ] || continue
+        if docker inspect -f '{{range .Mounts}}{{if eq .Type "bind"}}{{println .Source}}{{end}}{{end}}' "$id" 2>/dev/null |
+            awk '$0 == "/root" || index($0, "/root/") == 1 {found=1} END {exit !found}'; then
+            printf '%s\n' "$id" >> "$CONTAINER_STATE_FILE"
+        fi
+    done < <(docker ps -q)
+    while IFS= read -r id; do
+        [ -n "$id" ] || continue
+        docker stop --time 30 "$id" >> "$LOG_FILE" 2>&1
+    done < "$CONTAINER_STATE_FILE"
+fi
+
+rclone sync \
+  "$SRC1" "$DEST1" \
+  --exclude '/.cache/**' \
+  --exclude '/.npm/**' \
+  --exclude '/.nvm/**' \
+  --exclude '/emby/**' \
+  --exclude '**/node_modules/**' \
+  --exclude '**/logs/**' \
+  --exclude '**/*.log' \
+  --exclude '**/.migration-*/rollback/**' \
+  --exclude '**/.tmp/**' \
+  --exclude '**/*.tmp' \
+  --exclude '**/*.temp' \
+  --transfers=2 \
+  --checkers=4 \
+  --fast-list \
+  --bwlimit="${DAIMON_ROOT_BWLIMIT:-512K}" \
+  --contimeout=30s \
+  --timeout=2m \
+  --retries=3 \
+  --low-level-retries=2 \
+  --log-file="$LOG_FILE" \
+  --log-level INFO
+
+BACKUP_OK=1
+EOF
+			;;
 		emby)
 			cat > "$script_file" <<'EOF'
 #!/bin/bash
@@ -21922,6 +22060,7 @@ DEST="kissska1:Emby"
 LOG_DIR="/var/log/rclone"
 LOG_FILE="$LOG_DIR/emby_root_backup_$(date +%F).log"
 LOCK_FILE="/run/lock/daimon-emby-root-backup.lock"
+GLOBAL_LOCK_FILE="/run/lock/daimon-rclone-backups.lock"
 SUCCESS_FILE="$LOG_DIR/emby_root_backup.last-success"
 
 command -v flock >/dev/null 2>&1 || { printf '%s\n' "flock 未安装" >&2; exit 1; }
@@ -21929,6 +22068,8 @@ install -d -m 700 "$LOG_DIR" "$(dirname "$LOCK_FILE")"
 touch "$LOG_FILE" && chmod 600 "$LOG_FILE"
 exec 9>"$LOCK_FILE"
 flock -n 9 || { printf '%s\n' "已有 Emby 备份运行，跳过本次任务" >> "$LOG_FILE"; exit 0; }
+exec 8>"$GLOBAL_LOCK_FILE"
+flock -x 8
 
 printf '===== %s 开始 Emby 目录备份 =====\n' "$(date -Is)" >> "$LOG_FILE"
 timeout 7d rclone sync "$SRC1" "$DEST" \
@@ -21964,6 +22105,7 @@ DEST1="kissska1:$SCRIPT_NAME"
 LOG_DIR="/var/log/rclone"
 LOG_FILE="$LOG_DIR/${SCRIPT_NAME}_$(date +%F).log"
 LOCK_FILE="/run/lock/daimon-${SCRIPT_NAME}.lock"
+GLOBAL_LOCK_FILE="/run/lock/daimon-rclone-backups.lock"
 SUCCESS_FILE="$LOG_DIR/${SCRIPT_NAME}.last-success"
 
 command -v flock >/dev/null 2>&1 || { printf '%s\n' "flock 未安装" >&2; exit 1; }
@@ -21971,6 +22113,8 @@ install -d -m 700 "$LOG_DIR" "$(dirname "$LOCK_FILE")"
 touch "$LOG_FILE" && chmod 600 "$LOG_FILE"
 exec 9>"$LOCK_FILE"
 flock -n 9 || { printf '%s\n' "已有备份运行，跳过本次任务" >> "$LOG_FILE"; exit 0; }
+exec 8>"$GLOBAL_LOCK_FILE"
+flock -x 8
 
 echo "===== $(date -Is) 开始备份 =====" >> "$LOG_FILE"
 
@@ -22060,10 +22204,8 @@ crontab_sync_reconcile_legacy() {
 		fi
 	done
 
-	bit_schedule=$(printf '%s\n' "$bit_old_line" | awk '{print $1" "$2" "$3" "$4" "$5}')
-	via_schedule=$(printf '%s\n' "$via_old_line" | awk '{print $1" "$2" "$3" "$4" "$5}')
-	[ -z "$bit_schedule" ] && bit_schedule="0 6 * * *"
-	[ -z "$via_schedule" ] && via_schedule="30 4 * * *"
+	bit_schedule=$(crontab_sync_cron_line_by_id bitwarden "$bit_new")
+	via_schedule=$(crontab_sync_cron_line_by_id via "$via_new")
 
 	local cron_backup filtered_cron
 	cron_backup=$(mktemp) || return 1
@@ -22074,11 +22216,11 @@ crontab_sync_reconcile_legacy() {
 		| grep -vF 'Infini-cloud' || true)
 	if $had_bit; then
 		filtered_cron="$filtered_cron
-$bit_schedule /bin/bash $bit_new >> /var/log/rclone/cron_Vaultwarden_OneDrive_to_Kissska1.log 2>&1"
+$bit_schedule"
 	fi
 	if $had_via; then
 		filtered_cron="$filtered_cron
-$via_schedule /bin/bash $via_new >> /var/log/rclone/cron_Via_OneDrive_to_Kissska1.log 2>&1"
+$via_schedule"
 	fi
 	if ! printf '%s\n' "$filtered_cron" | sed '/^[[:space:]]*$/d' | crontab -; then
 		crontab "$cron_backup" 2>/dev/null || true
@@ -22101,7 +22243,7 @@ crontab_sync_install_one() {
 		return 1
 	fi
 	case "$id" in
-		bitwarden|via|emby|custom)
+		bitwarden|via|root|emby|custom)
 			if ! crontab_sync_remote_ready; then
 				echo -e "${gl_hong}kissska1 连接检查失败，未修改脚本和定时任务。${gl_bai}"
 				return 1
@@ -22130,7 +22272,7 @@ crontab_sync_show_status() {
 	local file cron_line id name
 
 	echo -e "${gl_kjlan}------------------------${gl_bai}"
-	for n in 1 2 3 4 5; do
+	for n in 1 2 3 4 5 6; do
 		id=$(crontab_sync_builtin_id_by_number "$n")
 		name=$(crontab_sync_builtin_name_by_id "$id")
 		file=$(crontab_sync_script_file_by_id "$id")
@@ -22147,7 +22289,7 @@ crontab_sync_show_status() {
 			custom_count=$((custom_count + 1))
 			file="$(crontab_sync_script_file_by_id custom "$file_name")"
 			cron_line=$(crontab_sync_cron_line_by_id custom "$file")
-			printf "%2d. %-20s %-58s %b\n" "$((5 + custom_count))" "${file_name%.sh}" "$file" "$(crontab_sync_status_text custom "$file" "$cron_line")"
+			printf "%2d. %-20s %-58s %b\n" "$((6 + custom_count))" "${file_name%.sh}" "$file" "$(crontab_sync_status_text custom "$file" "$cron_line")"
 		done
 	fi
 	echo -e "${gl_kjlan}------------------------${gl_bai}"
@@ -22157,7 +22299,7 @@ crontab_sync_get_item_by_number() {
 	local num="$1"
 	local id file cron_line
 	case "$num" in
-		1|2|3|4|5)
+		1|2|3|4|5|6)
 			id=$(crontab_sync_builtin_id_by_number "$num")
 			file=$(crontab_sync_script_file_by_id "$id")
 			cron_line=$(crontab_sync_cron_line_by_id "$id" "$file")
@@ -22166,7 +22308,7 @@ crontab_sync_get_item_by_number() {
 			;;
 	esac
 
-	local custom_index=$((num - 6))
+	local custom_index=$((num - 7))
 	if [ "$custom_index" -ge 0 ]; then
 		local custom_files=()
 		mapfile -t custom_files < <(crontab_sync_custom_files)
@@ -22203,7 +22345,7 @@ crontab_sync_handle_numbers() {
 }
 
 crontab_sync_all_numbers() {
-	local count=5
+	local count=6
 	local custom_files=()
 	mapfile -t custom_files < <(crontab_sync_custom_files)
 	count=$((count + ${#custom_files[@]}))
@@ -22219,10 +22361,11 @@ crontab_sync_create_custom() {
 	name=$(echo "$name" | sed 's/[[:space:]]/_/g; s/[^A-Za-z0-9_.-]/_/g')
 	[ -z "${name//_/}" ] && { echo "名称无效"; return 1; }
 	[[ "$name" == *.sh ]] || name="${name}.sh"
+	[ "$name" != "Root_Backup.sh" ] || { echo "Root_Backup.sh 是内置任务，请使用 /root Docker 一致性备份脚本。"; return 1; }
 	file=$(crontab_sync_script_file_by_id custom "$name")
-	read -e -i "45 4 * * *" -p "请输入定时规则（默认 45 4 * * *）: " cron_expr || return 1
+	read -e -i "45 4 * * *" -p "请输入上海时间定时规则（固定时分，每天或每周，默认 45 4 * * *）: " cron_expr || return 1
 	cron_expr="${cron_expr:-45 4 * * *}"
-	cron_line="$cron_expr /bin/bash $file >> /var/log/rclone/cron_${name%.sh}.log 2>&1"
+	cron_line=$(crontab_sync_cron_entry "$cron_expr /bin/bash $file >> /var/log/rclone/cron_${name%.sh}.log 2>&1") || { echo "仅支持固定时分的每天/每周规则，例如 45 4 * * * 或 45 4 * * 0。"; return 1; }
 
 	if ! command -v rclone >/dev/null 2>&1; then
 		echo -e "${gl_hong}未检测到 rclone，请先安装 rclone。${gl_bai}"
@@ -22234,10 +22377,20 @@ crontab_sync_create_custom() {
 	fi
 	check_crontab_installed
 	crontab_sync_write_script custom "$file"
-	(crontab -l 2>/dev/null | grep -vF "$file"; echo "$cron_line") | crontab -
+	(crontab -l 2>/dev/null | grep -vF "$file" || true; echo "$cron_line") | crontab - || return 1
 	echo -e "${gl_lv}自定义同步脚本已创建${gl_bai}"
 	echo "脚本路径: $file"
 	echo "定时任务: $cron_line"
+}
+
+crontab_sync_run_root_once() {
+	root_use
+	local file confirm
+	file=$(crontab_sync_script_file_by_id root)
+	read -r -p "将停止当前运行的 Docker 容器并执行一次 /root 一致性备份，输入 RUN_ROOT_BACKUP 确认：" confirm || return 1
+	[ "$confirm" = RUN_ROOT_BACKUP ] || { echo "已取消"; return 0; }
+	crontab_sync_write_script root "$file" || return 1
+	/bin/bash "$file"
 }
 
 crontab_sync_manager() {
@@ -22253,6 +22406,7 @@ crontab_sync_manager() {
 		echo -e "${gl_kjlan}3.   ${gl_bai}一键安装（默认全选，可自行删除编号）"
 		echo -e "${gl_kjlan}4.   ${gl_bai}一键卸载（默认全选，可自行删除编号）"
 		echo -e "${gl_kjlan}5.   ${gl_bai}自定义脚本"
+		echo -e "${gl_kjlan}6.   ${gl_bai}立即执行一次 /root Docker 一致性备份"
 		echo -e "${gl_kjlan}0.   ${gl_bai}返回主菜单"
 		echo -e "${gl_kjlan}------------------------${gl_bai}"
 		read -e -p "请输入你的选择: " sub_choice || return 1
@@ -22283,6 +22437,7 @@ crontab_sync_manager() {
 				fi
 				;;
 			5) crontab_sync_create_custom ;;
+			6) crontab_sync_run_root_once ;;
 			0) return ;;
 			*) echo "无效的输入!" ;;
 		esac

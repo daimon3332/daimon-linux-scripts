@@ -429,6 +429,28 @@ test_generated_backup_policies() {
     [[ "$emby_script" == *'flock -n 9'* ]] || return 1
     ! grep -qE 'before-restore|还原前备份|是否创建迁移备份|backup_resolv_conf_once|ssh_config_backup' "$SOURCE"
 }
+test_generated_root_backup_policy() {
+    local fixture="$WORK/root-backup" script cron
+    load_function crontab_sync_write_script || return 1
+    load_function crontab_sync_cron_line_by_id || return 1
+    load_function crontab_sync_cron_entry || return 1
+    crontab_sync_log_dir() { printf '%s\n' "$fixture/logs"; }
+    mkdir -p "$fixture"
+    crontab_sync_write_script root "$fixture/Root_Backup.sh" || return 1
+    script=$(cat "$fixture/Root_Backup.sh")
+    bash -n "$fixture/Root_Backup.sh" || return 1
+    grep -Fq 'DEST1="kissska1:Root_Backup"' "$fixture/Root_Backup.sh" || return 1
+    grep -Fq 'docker inspect -f' "$fixture/Root_Backup.sh" || return 1
+    grep -Fq 'Type "bind"' "$fixture/Root_Backup.sh" || return 1
+    grep -Fq 'index($0, "/root/") == 1' "$fixture/Root_Backup.sh" || return 1
+    grep -Fq 'BACKUP_OK=1' "$fixture/Root_Backup.sh" || return 1
+    grep -Fq 'date -Is > "$SUCCESS_FILE"' "$fixture/Root_Backup.sh" || return 1
+    grep -Fq 'docker stop --time 30' "$fixture/Root_Backup.sh" || return 1
+    grep -Fq 'docker start "$id"' "$fixture/Root_Backup.sh" || return 1
+    cron=$(crontab_sync_cron_line_by_id root /root/linux-daimon/backup-sh/Root_Backup.sh)
+    [[ "$cron" == *'TZ=Asia/Shanghai date +\%H:\%M'* && "$cron" == *'"04:25"'* ]] || return 1
+    ! crontab_sync_cron_entry '99 99 * * * echo invalid'
+}
 
 test_remote_names_privacy() {
     local output
@@ -736,6 +758,7 @@ for mode in success invalid concurrent; do check "credential transaction $mode" 
 for mode in success corrupt traversal; do check "Vaultwarden archive $mode" test_vault_archive "$mode"; done
 for kind in bitwarden custom emby; do check "generated $kind sync propagates failure" test_generated_sync_failure "$kind"; done
 check 'generated backup policies exclude bulky data and avoid pre-operation backups' test_generated_backup_policies
+check 'generated root backup freezes bind-mounted Docker services' test_generated_root_backup_policy
 check 'remote names and types do not expose tokens' test_remote_names_privacy
 check 'Compose labels preserve project name and override files' test_compose_context_labels
 check 'clean Compose hosts derive project name from config' test_compose_context_clean_host

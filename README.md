@@ -253,9 +253,9 @@ Compose 自动更新不会预先执行 `docker compose down`。每个任务使�
 | 10 | 安装 nginx | 安装、启动并设置 Nginx 开机自启 |
 | 11 | 备份域名 + nginx 配置 | 替换最新本地备份 `/root/linux-daimon/backup/nginx-domain/auto_latest` |
 | 12 | 恢复域名 + nginx 配置 | 从 `/root/linux-daimon/backup/nginx-domain/auto_latest` 合并恢复 `sites-available` 和 `/root/domain`，并重建 `sites-enabled` 软链接；同名文件保留本机版本 |
-| 13 | 迁移/修复现有证书 | 将 acme.sh 证书迁移到 webroot 模式并保留当前 Nginx 证书路径；可选择是否创建迁移备份，逐域名报告成功、失败和跳过 |
+| 13 | 迁移/修复现有证书 | 将 acme.sh 证书迁移到 webroot 模式并保留当前 Nginx 证书路径；不创建操作前备份，逐域名报告成功、失败和跳过 |
 
-进入 Nginx + 域名管理时只显示域名备份脚本是否开启；安装 Nginx、申请证书或配置 Nginx 时会自动开启每天 05:00 的本地备份脚本。证书续期任务为每天 03:00 的 `/root/linux-daimon/cert-renew.sh`，日志位于 `/var/log/acme.sh/renew.log`。脚本运行时检测 `/root/domain/*/fullchain.pem`，有域名才刷新 `auto_latest`，无域名则跳过且保留已有备份。恢复时合并备份内容，同名冲突以本机现有文件为准。主脚本更新时可选择是否同步 Nginx + 域名续期脚本。
+进入 Nginx + 域名管理时只显示域名备份脚本是否开启；安装 Nginx、申请证书或配置 Nginx 时会自动开启每天上海时间 04:00 的本地备份脚本。证书续期任务为每天 03:00 的 `/root/linux-daimon/cert-renew.sh`，日志位于 `/var/log/acme.sh/renew.log`。脚本运行时检测 `/root/domain/*/fullchain.pem`，有域名才刷新 `auto_latest`，无域名则跳过且保留已有备份。恢复时合并备份内容，同名冲突以本机现有文件为准。主脚本更新时可选择是否同步 Nginx + 域名续期脚本。
 
 ### fail2ban管理
 
@@ -302,7 +302,7 @@ Compose 自动更新不会预先执行 `docker compose down`。每个任务使�
 | 1 | 配置 rclone.conf 文件 | 选择有效 remote，通过本机备份镜像的 rclone 直接验证，仅替换 `BitwardenBackup` 和必要依赖；保留其他 remote，不打印 token |
 | 2 | 数据备份 | 对运行中的 `vaultwarden-backup` 容器执行 `/app/backup.sh`；退出码和上传成功字段必须同时满足 |
 | 3 | 数据还原 | 读取实际 remote 和数据卷，要求使用者已停止；重新下载并校验 ZIP，隔离解密，验证 SQLite 和归档路径后替换 named volume 数据 |
-| 4 | 配置 Bitwarden 同步脚本 | 写入 `/root/linux-daimon/backup-sh/Vaultwarden_OneDrive_to_Kissska1.sh`，并添加每天 06:00 同步到 `kissska1` 的 crontab |
+| 4 | 配置 Bitwarden 同步脚本 | 写入 `/root/linux-daimon/backup-sh/Vaultwarden_OneDrive_to_Kissska1.sh`，并添加上海时间 05:05 同步到 `kissska1` 的 crontab |
 | 0 | 返回主菜单 | 返回上一级菜单 |
 
 ### crontab同步脚本管理
@@ -313,20 +313,23 @@ Compose 自动更新不会预先执行 `docker compose down`。每个任务使�
 
 | 序号 | 名称 | 作用 |
 |---:|---|---|
-| 1 | Bitwarden 同步脚本 | 每天 06:00 从 `qq3303338052@outlook` 同步 Bitwarden 备份到 `kissska1` |
-| 2 | 图床同步脚本 | 每天 04:00 同步图床数据 |
-| 3 | Via 同步脚本 | 每天 04:30 从 `qq3303338052@outlook:Via` 同步到 `kissska1:Via` |
-| 4 | 域名和nginx配置备份脚本 | 每天 05:00 本地备份到 `/root/linux-daimon/backup/nginx-domain/auto_latest`，只保留 1 份，不使用 rclone |
+| 1 | Bitwarden 同步脚本 | 每天上海时间 05:05 从 `qq3303338052@outlook` 同步 Bitwarden 备份到 `kissska1` |
+| 2 | 图床同步脚本 | 每天上海时间 04:10 同步图床数据 |
+| 3 | Via 同步脚本 | 每天上海时间 04:15 从 `qq3303338052@outlook:Via` 同步到 `kissska1:Via` |
+| 4 | 域名和nginx配置备份脚本 | 每天上海时间 04:00 本地备份到 `/root/linux-daimon/backup/nginx-domain/auto_latest`，只保留 1 份，不使用 rclone |
+| 5 | Emby目录低速备份脚本 | 每周日上海时间 05:45 同步 `/root/emby`，与其他 rclone 任务共用锁 |
+| 6 | `/root` Docker 一致性备份脚本 | 每天上海时间 04:25 停止运行中的 Docker 容器，同步 `/root` 后自动恢复容器 |
 
 新版脚本启动或进入本菜单时，会先验证 `kissska1`，再自动删除旧 Infini-cloud 任务和脚本，保留原执行时间并生成对应的 kissska1 同步任务。
 
 | 序号 | 选项 | 作用 |
 |---:|---|---|
-| 1 | 安装脚本 | 支持多选安装 Bitwarden、图床、Via、域名和 Nginx 配置备份或已有自定义脚本 |
+| 1 | 安装脚本 | 支持多选安装 Bitwarden、图床、Via、域名和 Nginx、`/root`、Emby 备份或已有自定义脚本 |
 | 2 | 卸载脚本 | 支持多选删除脚本文件和对应 crontab |
 | 3 | 一键安装 | 默认预填所有脚本编号，用户可自行删除编号 |
 | 4 | 一键卸载 | 默认预填所有脚本编号，用户可自行删除编号 |
-| 5 | 自定义脚本 | 输入脚本名称，自动补全 `.sh`，写入通用 `/root` 备份模板 |
+| 5 | 自定义脚本 | 输入脚本名称，自动补全 `.sh`，写入通用 `/root` 备份模板；所有自带定时规则按上海时间执行 |
+| 6 | 立即执行一次 `/root` Docker 一致性备份 | 需要输入 `RUN_ROOT_BACKUP`，停止并恢复当前运行中的 Docker 容器 |
 | 0 | 返回主菜单 | 返回上一级菜单 |
 
 
