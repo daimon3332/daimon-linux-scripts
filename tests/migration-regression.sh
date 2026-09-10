@@ -6,6 +6,7 @@ mkdir -p "$ROOT/.tmp"
 WORK=$(mktemp -d "$ROOT/.tmp/migration.XXXXXX") || exit 1
 trap 'rm -rf -- "$WORK"' EXIT
 export TMPDIR="$WORK"
+export DAIMON_RCLONE_RUNNER_FILE="$WORK/rclone-runner.sh"
 export DAIMON_RESTORE_ROOT="$WORK/root"
 export DAIMON_NGINX_DIR="$WORK/nginx"
 mkdir -p "$DAIMON_RESTORE_ROOT" "$DAIMON_NGINX_DIR"
@@ -31,6 +32,9 @@ while IFS= read -r fn; do
     load_function "$fn" || exit 1
 done < <(awk '/^rclone_status_text\(\)/ {active=1} /^crontab_sync_backup_dir\(\)/ {active=0}
     active && /^[a-zA-Z_]+\(\) [({]/ {sub(/\(.*/, ""); print}' "$SOURCE")
+for fn in crontab_sync_backup_dir crontab_sync_log_cache_file crontab_sync_log_run_dir crontab_sync_runner_file crontab_sync_write_runner crontab_sync_write_run_tools; do
+    load_function "$fn" || exit 1
+done
 root_use() { :; }
 passed=0 failed=0
 check() {
@@ -325,6 +329,7 @@ test_rclone_menu_has_only_restore_workflows() {
     output=$(rclone_manager <<< 0) || return 1
     [[ "$output" == *'1.   安装 rclone'* ]] &&
         [[ "$output" == *'6.   Docker Compose 恢复'* ]] &&
+        [[ "$output" == *'7.   自动同步记录'* ]] &&
         [[ "$output" == *'0.   返回主菜单'* ]] &&
         [[ "$output" != *'Docker named volume 清单/恢复'* ]] &&
         [[ "$output" != *'恢复后 DNS/HTTPS 只读验证'* ]] &&
@@ -451,6 +456,35 @@ test_generated_root_backup_policy() {
     cron=$(crontab_sync_cron_line_by_id root /root/linux-daimon/backup-sh/Root_Backup.sh)
     [[ "$cron" == *'TZ=Asia/Shanghai date +\%H:\%M'* && "$cron" == *'"04:25"'* ]] || return 1
     ! crontab_sync_cron_entry '99 99 * * * echo invalid'
+}
+
+test_rclone_runner_records_status() {
+    local fixture="$WORK/runner" runner cache log success_script failure_script old_epoch
+    mkdir -p "$fixture"
+    runner="$fixture/runner.sh"
+    cache="$fixture/status.tsv"
+    export DAIMON_RCLONE_RUNNER_FILE="$runner"
+    export DAIMON_RCLONE_STATUS_CACHE="$cache"
+    export DAIMON_RCLONE_RUN_LOG_DIR="$fixture/runs"
+    export DAIMON_RCLONE_STATUS_LOCK="$fixture/status.lock"
+    success_script="$fixture/success.sh"
+    failure_script="$fixture/failure.sh"
+    printf '#!/bin/bash\nprintf "sync ok\\n"\n' > "$success_script"
+    printf '#!/bin/bash\nprintf "error password=PRIVATE_FIXTURE\\n"\nexit 7\n' > "$failure_script"
+    chmod 700 "$success_script" "$failure_script"
+    crontab_sync_write_runner "$runner" || return 1
+    bash "$runner" success "$success_script" || return 1
+    grep -q $'\tsuccess\tsync\t成功\t0\t' "$cache" || return 1
+    if bash "$runner" failure "$failure_script"; then return 1; fi
+    grep -q $'\tfailure\tsync\t失败\t7\t' "$cache" || return 1
+    ! grep -q 'PRIVATE_FIXTURE' "$cache" || return 1
+    log=$(awk -F '\t' '$5 == "failure" {print $11}' "$cache")
+    [ -f "$log" ] || return 1
+    grep -q 'PRIVATE_FIXTURE' "$log" || return 1
+    old_epoch=$(($(date +%s) - 31 * 86400))
+    printf '%s\told\told\told-run\told\tsync\t成功\t0\t1\t1\t%s\t-\n' "$old_epoch" "$log" >> "$cache"
+    bash "$runner" success "$success_script" || return 1
+    ! grep -q $'\told\tsync\t' "$cache"
 }
 
 test_remote_names_privacy() {
@@ -760,6 +794,7 @@ for mode in success corrupt traversal; do check "Vaultwarden archive $mode" test
 for kind in bitwarden custom emby; do check "generated $kind sync propagates failure" test_generated_sync_failure "$kind"; done
 check 'generated backup policies exclude bulky data and avoid pre-operation backups' test_generated_backup_policies
 check 'generated root backup freezes bind-mounted Docker services' test_generated_root_backup_policy
+check 'rclone runner records, redacts, and expires statuses' test_rclone_runner_records_status
 check 'remote names and types do not expose tokens' test_remote_names_privacy
 check 'Compose labels preserve project name and override files' test_compose_context_labels
 check 'clean Compose hosts derive project name from config' test_compose_context_clean_host

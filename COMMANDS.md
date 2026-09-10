@@ -1683,7 +1683,7 @@ rclone sync \
 echo "===== $(date) Vaultwarden 备份同步完成（sync） =====" >> "$LOG_FILE"
 EOF
 chmod +x /root/linux-daimon/backup-sh/Vaultwarden_OneDrive_to_Kissska1.sh
-(crontab -l 2>/dev/null | grep -vF "/root/linux-daimon/backup-sh/Vaultwarden_OneDrive_to_Kissska1.sh"; echo '* * * * * [ "$(TZ=Asia/Shanghai date +\%H:\%M)" = "05:05" ] && /bin/bash /root/linux-daimon/backup-sh/Vaultwarden_OneDrive_to_Kissska1.sh >> /var/log/rclone/cron_Vaultwarden_OneDrive_to_Kissska1.log 2>&1') | crontab -
+(crontab -l 2>/dev/null | grep -vF "/root/linux-daimon/backup-sh/Vaultwarden_OneDrive_to_Kissska1.sh"; echo '* * * * * [ "$(TZ=Asia/Shanghai date +\%H:\%M)" = "05:05" ] && /bin/bash /root/linux-daimon/backup-sh/.rclone-runner.sh bitwarden /root/linux-daimon/backup-sh/Vaultwarden_OneDrive_to_Kissska1.sh >> /var/log/rclone/cron_Vaultwarden_OneDrive_to_Kissska1.log 2>&1') | crontab -
 ```
 解释：脚本会自动检测同步脚本和 crontab 是否已配置；配置后每天上海时间 05:05 使用 `rclone sync` 从 `qq3303338052@outlook:/BitwardenBackup` 同步到 `kissska1:/BitwardenBackup`。Ubuntu cron 不支持 `CRON_TZ`，因此任务每分钟触发一次，由 `TZ=Asia/Shanghai` 时间门禁确保固定 UTC+8。
 
@@ -1702,7 +1702,7 @@ crontab -l
 ```bash
 mkdir -p /root/linux-daimon/backup-sh /var/log/rclone
 ```
-解释：所有同步脚本都放在 `/root/linux-daimon/backup-sh`，日志默认放在 `/var/log/rclone`。
+解释：所有同步脚本都放在 `/root/linux-daimon/backup-sh`，日志默认放在 `/var/log/rclone`。定时任务统一经过 `.rclone-runner.sh`，状态缓存为 `/var/cache/daimon/rclone-sync-status.tsv`，运行日志为 `/var/log/rclone/runs`。
 
 安装/卸载脚本：
 
@@ -1710,35 +1710,37 @@ mkdir -p /root/linux-daimon/backup-sh /var/log/rclone
 crontab -l 2>/dev/null | grep -vF "/root/linux-daimon/backup-sh/脚本名.sh" | crontab -
 cat > /root/linux-daimon/backup-sh/脚本名.sh
 chmod +x /root/linux-daimon/backup-sh/脚本名.sh
-(crontab -l 2>/dev/null | grep -vF "/root/linux-daimon/backup-sh/脚本名.sh"; echo "错开的时间 /bin/bash /root/linux-daimon/backup-sh/脚本名.sh >> /var/log/rclone/cron_脚本名.log 2>&1") | crontab -
+(crontab -l 2>/dev/null | grep -vF "/root/linux-daimon/backup-sh/脚本名.sh"; echo "错开的时间 /bin/bash /root/linux-daimon/backup-sh/.rclone-runner.sh custom:脚本名 /root/linux-daimon/backup-sh/脚本名.sh >> /var/log/rclone/cron_脚本名.log 2>&1") | crontab -
 ```
 解释：安装时写入脚本并添加定时任务；卸载时删除脚本文件，并删除 crontab 中包含该脚本路径的任务行。
+
+菜单中的“自动同步记录”读取本地缓存，默认展示最近 15 次；记录保留 30 天，状态包括执行中、成功、失败、被锁跳过和中断/未知。失败原因包含退出码并经过脱敏，完整日志可查看、通过 OSC 52/cpcat 复制，或导出到 `/root/linux-daimon/rclone-logs`。
 
 Bitwarden 同步脚本：
 
 ```bash
-* * * * * [ "$(TZ=Asia/Shanghai date +\%H:\%M)" = "05:05" ] && /bin/bash /root/linux-daimon/backup-sh/Vaultwarden_OneDrive_to_Kissska1.sh >> /var/log/rclone/cron_Vaultwarden_OneDrive_to_Kissska1.log 2>&1
+* * * * * [ "$(TZ=Asia/Shanghai date +\%H:\%M)" = "05:05" ] && /bin/bash /root/linux-daimon/backup-sh/.rclone-runner.sh bitwarden /root/linux-daimon/backup-sh/Vaultwarden_OneDrive_to_Kissska1.sh >> /var/log/rclone/cron_Vaultwarden_OneDrive_to_Kissska1.log 2>&1
 ```
 解释：每天上海时间 05:05 同步 `qq3303338052@outlook:/BitwardenBackup` 到 `kissska1:/BitwardenBackup`。
 
 图床同步脚本：
 
 ```bash
-* * * * * [ "$(TZ=Asia/Shanghai date +\%H:\%M)" = "04:10" ] && /bin/bash /root/linux-daimon/backup-sh/ImageBed_CloudFlare-R2_to_OneDrive.sh >> /var/log/rclone/cron_ImageBed_CloudFlare-R2_to_OneDrive.log 2>&1
+* * * * * [ "$(TZ=Asia/Shanghai date +\%H:\%M)" = "04:10" ] && /bin/bash /root/linux-daimon/backup-sh/.rclone-runner.sh imagebed /root/linux-daimon/backup-sh/ImageBed_CloudFlare-R2_to_OneDrive.sh >> /var/log/rclone/cron_ImageBed_CloudFlare-R2_to_OneDrive.log 2>&1
 ```
 解释：每天上海时间 04:10 同步 `qq3303338052@cloudflare:image-bed-daimon` 到 `qq3303338052@outlook:image-bed-daimon`。
 
 Via 同步脚本：
 
 ```bash
-* * * * * [ "$(TZ=Asia/Shanghai date +\%H:\%M)" = "04:15" ] && /bin/bash /root/linux-daimon/backup-sh/Via_OneDrive_to_Kissska1.sh >> /var/log/rclone/cron_Via_OneDrive_to_Kissska1.log 2>&1
+* * * * * [ "$(TZ=Asia/Shanghai date +\%H:\%M)" = "04:15" ] && /bin/bash /root/linux-daimon/backup-sh/.rclone-runner.sh via /root/linux-daimon/backup-sh/Via_OneDrive_to_Kissska1.sh >> /var/log/rclone/cron_Via_OneDrive_to_Kissska1.log 2>&1
 ```
 解释：每天上海时间 04:15 同步 `qq3303338052@outlook:Via` 到 `kissska1:Via`。
 
 域名和 nginx 配置备份脚本：
 
 ```bash
-* * * * * [ "$(TZ=Asia/Shanghai date +\%H:\%M)" = "04:00" ] && /bin/bash /root/linux-daimon/backup-sh/Nginx_Domain_Local_Backup.sh >> /var/log/rclone/cron_Nginx_Domain_Local_Backup.log 2>&1
+* * * * * [ "$(TZ=Asia/Shanghai date +\%H:\%M)" = "04:00" ] && /bin/bash /root/linux-daimon/backup-sh/.rclone-runner.sh nginxdomain /root/linux-daimon/backup-sh/Nginx_Domain_Local_Backup.sh >> /var/log/rclone/cron_Nginx_Domain_Local_Backup.log 2>&1
 ```
 解释：每天上海时间 04:00 在服务器本地备份 `sites-available`、enabled 站点名称和 `/root/domain` 到 `/root/linux-daimon/backup/nginx-domain/auto_latest`；每次覆盖旧备份，只保留 1 份，不使用 rclone。未检测到 `/root/domain/*/fullchain.pem` 时跳过备份并保留已有 `auto_latest`。
 
@@ -1746,14 +1748,14 @@ Via 同步脚本：
 
 ```bash
 cat > /root/linux-daimon/backup-sh/自定义名称.sh
-* * * * * [ "$(TZ=Asia/Shanghai date +\%H:\%M)" = "04:45" ] && /bin/bash /root/linux-daimon/backup-sh/自定义名称.sh >> /var/log/rclone/cron_自定义名称.log 2>&1
+* * * * * [ "$(TZ=Asia/Shanghai date +\%H:\%M)" = "04:45" ] && /bin/bash /root/linux-daimon/backup-sh/.rclone-runner.sh custom:自定义名称 /root/linux-daimon/backup-sh/自定义名称.sh >> /var/log/rclone/cron_自定义名称.log 2>&1
 ```
 解释：脚本名称会自动补全 `.sh` 后缀；脚本内使用文件名作为远端目录名，把 `/root` 低速同步到 `kissska1:脚本名`，排除 `.cache`、`.npm`、`.nvm`、`node_modules`、日志、迁移回滚、临时文件和 `/root/emby`。脚本带并发锁、失败传播和成功标记。
 
 Emby 目录低速备份脚本：
 
 ```bash
-* * * * * [ "$(TZ=Asia/Shanghai date +\%H:\%M)" = "05:45" ] && [ "$(TZ=Asia/Shanghai date +\%w)" = "0" ] && /bin/bash /root/linux-daimon/backup-sh/Emby_Root_Backup.sh >> /var/log/rclone/cron_Emby_Root_Backup.log 2>&1
+* * * * * [ "$(TZ=Asia/Shanghai date +\%H:\%M)" = "05:45" ] && [ "$(TZ=Asia/Shanghai date +\%w)" = "0" ] && /bin/bash /root/linux-daimon/backup-sh/.rclone-runner.sh emby /root/linux-daimon/backup-sh/Emby_Root_Backup.sh >> /var/log/rclone/cron_Emby_Root_Backup.log 2>&1
 ```
 
 解释：每周日上海时间 05:45 将固定源目录 `/root/emby` 低速同步到 `kissska1:Emby`，单并发并排除日志和迁移回滚目录；与其他 rclone 任务共用锁，不会并发传输；不创建操作前备份。
