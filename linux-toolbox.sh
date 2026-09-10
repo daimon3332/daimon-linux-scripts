@@ -22012,7 +22012,7 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     while IFS= read -r id; do
         [ -n "$id" ] || continue
         if docker inspect -f '{{range .Mounts}}{{if eq .Type "bind"}}{{println .Source}}{{end}}{{end}}' "$id" 2>/dev/null |
-            awk '$0 == "/root" || index($0, "/root/") == 1 {found=1} END {exit !found}'; then
+            awk '$0 == "/root" || (index($0, "/root/") == 1 && $0 != "/root/emby" && index($0, "/root/emby/") != 1) {found=1} END {exit !found}'; then
             printf '%s\n' "$id" >> "$CONTAINER_STATE_FILE"
         fi
     done < <(docker ps -q)

@@ -443,6 +443,7 @@ test_generated_root_backup_policy() {
     grep -Fq 'docker inspect -f' "$fixture/Root_Backup.sh" || return 1
     grep -Fq 'Type "bind"' "$fixture/Root_Backup.sh" || return 1
     grep -Fq 'index($0, "/root/") == 1' "$fixture/Root_Backup.sh" || return 1
+    grep -Fq 'index($0, "/root/emby/") != 1' "$fixture/Root_Backup.sh" || return 1
     grep -Fq 'BACKUP_OK=1' "$fixture/Root_Backup.sh" || return 1
     grep -Fq 'date -Is > "$SUCCESS_FILE"' "$fixture/Root_Backup.sh" || return 1
     grep -Fq 'docker stop --time 30' "$fixture/Root_Backup.sh" || return 1
