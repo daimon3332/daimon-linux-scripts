@@ -32,7 +32,7 @@ while IFS= read -r fn; do
     load_function "$fn" || exit 1
 done < <(awk '/^rclone_status_text\(\)/ {active=1} /^crontab_sync_backup_dir\(\)/ {active=0}
     active && /^[a-zA-Z_]+\(\) [({]/ {sub(/\(.*/, ""); print}' "$SOURCE")
-for fn in crontab_sync_backup_dir crontab_sync_log_cache_file crontab_sync_log_run_dir crontab_sync_runner_file crontab_sync_write_runner crontab_sync_write_run_tools; do
+for fn in crontab_sync_backup_dir crontab_sync_log_cache_file crontab_sync_log_run_dir crontab_sync_runner_file crontab_sync_write_runner crontab_sync_write_run_tools crontab_sync_custom_files; do
     load_function "$fn" || exit 1
 done
 root_use() { :; }
@@ -459,7 +459,7 @@ test_generated_root_backup_policy() {
 }
 
 test_rclone_runner_records_status() {
-    local fixture="$WORK/runner" runner cache log success_script failure_script old_epoch
+    local fixture="$WORK/runner" runner cache log success_script failure_script old_epoch stale_epoch
     mkdir -p "$fixture"
     runner="$fixture/runner.sh"
     cache="$fixture/status.tsv"
@@ -481,10 +481,21 @@ test_rclone_runner_records_status() {
     log=$(awk -F '\t' '$5 == "failure" {print $11}' "$cache")
     [ -f "$log" ] || return 1
     grep -q 'PRIVATE_FIXTURE' "$log" || return 1
+    stale_epoch=$(($(date +%s) - 7200))
+    printf '%s\tstale\t-\tstale-run\tstale\tsync\t执行中\t-\t0\t1\t%s\t-\n' "$stale_epoch" "$log" >> "$cache"
     old_epoch=$(($(date +%s) - 31 * 86400))
     printf '%s\told\told\told-run\told\tsync\t成功\t0\t1\t1\t%s\t-\n' "$old_epoch" "$log" >> "$cache"
     bash "$runner" success "$success_script" || return 1
+    grep -q $'\tstale\tsync\t中断/未知\t-\t' "$cache" || return 1
     ! grep -q $'\told\tsync\t' "$cache"
+}
+
+test_rclone_runner_is_not_custom_task() {
+    local fixture="$WORK/custom-list"
+    mkdir -p "$fixture"
+    export DAIMON_BACKUP_SH_DIR="$fixture"
+    touch "$fixture/.rclone-runner.sh" "$fixture/fixture.sh"
+    [ "$(crontab_sync_custom_files)" = fixture.sh ]
 }
 
 test_remote_names_privacy() {
@@ -795,6 +806,7 @@ for kind in bitwarden custom emby; do check "generated $kind sync propagates fai
 check 'generated backup policies exclude bulky data and avoid pre-operation backups' test_generated_backup_policies
 check 'generated root backup freezes bind-mounted Docker services' test_generated_root_backup_policy
 check 'rclone runner records, redacts, and expires statuses' test_rclone_runner_records_status
+check 'rclone runner is excluded from custom tasks' test_rclone_runner_is_not_custom_task
 check 'remote names and types do not expose tokens' test_remote_names_privacy
 check 'Compose labels preserve project name and override files' test_compose_context_labels
 check 'clean Compose hosts derive project name from config' test_compose_context_clean_host

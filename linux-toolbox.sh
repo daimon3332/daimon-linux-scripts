@@ -21717,7 +21717,7 @@ run_id="$(date +%Y%m%d-%H%M%S)-$$-$safe_task"
 run_log="$RUN_DIR/$run_id.log"
 exec 9>"$LOCK_FILE"; flock -x 9
 cutoff=$((epoch - 30 * 86400)); tmp_cache=$(mktemp "$CACHE_FILE.XXXXXX") || exit 1
-awk -F '\t' -v cutoff="$cutoff" '$1 >= cutoff {if ($7 == "执行中" && $1 < cutoff - 3600) {$7="中断/未知"; $8="-"; $12="运行器未正常结束"} print}' "$CACHE_FILE" > "$tmp_cache" || true
+awk -F '\t' -v OFS='\t' -v cutoff="$cutoff" -v stale="$((epoch - 3600))" '$1 >= cutoff {if ($7 == "执行中" && $1 < stale) {$7="中断/未知"; $8="-"; $12="运行器未正常结束"} print}' "$CACHE_FILE" > "$tmp_cache" || true
 printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$epoch" "$started" "-" "$run_id" "$safe_task" "sync" "执行中" "-" "0" "$$" "$run_log" "-" >> "$tmp_cache"
 chmod 600 "$tmp_cache" && mv -f "$tmp_cache" "$CACHE_FILE"; flock -u 9
 export DAIMON_RUN_LOG="$run_log"
@@ -21979,6 +21979,7 @@ crontab_sync_custom_files() {
 	dir=$(crontab_sync_backup_dir)
 	[ -d "$dir" ] || return 0
 	find "$dir" -maxdepth 1 -type f -name '*.sh' \
+		! -name '.rclone-runner.sh' \
 		! -name 'Vaultwarden_OneDrive_to_Kissska1.sh' \
 		! -name 'Vaultwarden_OneDrive_to_Infini.sh' \
 		! -name 'ImageBed_CloudFlare-R2_to_OneDrive.sh' \
