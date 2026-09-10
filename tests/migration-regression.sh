@@ -32,7 +32,7 @@ while IFS= read -r fn; do
     load_function "$fn" || exit 1
 done < <(awk '/^rclone_status_text\(\)/ {active=1} /^crontab_sync_backup_dir\(\)/ {active=0}
     active && /^[a-zA-Z_]+\(\) [({]/ {sub(/\(.*/, ""); print}' "$SOURCE")
-for fn in crontab_sync_backup_dir crontab_sync_log_cache_file crontab_sync_log_run_dir crontab_sync_runner_file crontab_sync_write_runner crontab_sync_write_run_tools crontab_sync_custom_files; do
+for fn in crontab_sync_backup_dir crontab_sync_log_cache_file crontab_sync_log_run_dir crontab_sync_log_export_dir crontab_sync_runner_file crontab_sync_write_runner crontab_sync_write_run_tools crontab_sync_log_sanitize crontab_sync_log_copy crontab_sync_log_export crontab_sync_custom_files; do
     load_function "$fn" || exit 1
 done
 root_use() { :; }
@@ -498,6 +498,23 @@ test_rclone_runner_is_not_custom_task() {
     [ "$(crontab_sync_custom_files)" = fixture.sh ]
 }
 
+test_rclone_log_copy_and_export_are_redacted() {
+    local fixture="$WORK/log-actions" log output exported
+    mkdir -p "$fixture"
+    log="$fixture/run.log"
+    printf '%s\n' 'Authorization: Bearer PRIVATE_BEARER' 'error {"password": "PRIVATE_PASSWORD"}' 'url?tempauth=PRIVATE_AUTH' > "$log"
+    cpcat() {
+        printf 'CPCAT_CALLED\n'
+        grep -q '\[REDACTED\]' "$1" && ! grep -q 'PRIVATE_' "$1"
+    }
+    output=$(crontab_sync_log_copy "$log") || return 1
+    [[ "$output" == *CPCAT_CALLED* ]] || return 1
+    export DAIMON_RCLONE_EXPORT_DIR="$fixture/export"
+    crontab_sync_log_export "$log" >/dev/null || return 1
+    exported="$fixture/export/run.redacted.log"
+    [ -f "$exported" ] && grep -q '\[REDACTED\]' "$exported" && ! grep -q 'PRIVATE_' "$exported"
+}
+
 test_remote_names_privacy() {
     local output
     rclone() { printf '{"fixture":{"type":"local","token":"PRIVATE_FIXTURE"}}\n'; }
@@ -807,6 +824,7 @@ check 'generated backup policies exclude bulky data and avoid pre-operation back
 check 'generated root backup freezes bind-mounted Docker services' test_generated_root_backup_policy
 check 'rclone runner records, redacts, and expires statuses' test_rclone_runner_records_status
 check 'rclone runner is excluded from custom tasks' test_rclone_runner_is_not_custom_task
+check 'rclone log copy and export redact credentials' test_rclone_log_copy_and_export_are_redacted
 check 'remote names and types do not expose tokens' test_remote_names_privacy
 check 'Compose labels preserve project name and override files' test_compose_context_labels
 check 'clean Compose hosts derive project name from config' test_compose_context_clean_host

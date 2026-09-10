@@ -21727,7 +21727,7 @@ finished=$(date -Is); end_epoch=$(date +%s); duration=$((end_epoch - epoch))
 status="成功"; reason="-"
 if [ "$rc" -ne 0 ]; then
     status="失败"
-    reason=$(grep -Ei 'error|failed|fatal|denied|timeout|cannot|无法|失败' "$run_log" 2>/dev/null | tail -n 1 | tr '\t\r\n' '   ' | sed -E 's/(access_token|refresh_token|client_secret|Bearer|tempauth|password)[=:][^[:space:]&]*/\1=[REDACTED]/Ig' | cut -c1-240)
+    reason=$(grep -Ei 'error|failed|fatal|denied|timeout|cannot|无法|失败' "$run_log" 2>/dev/null | tail -n 1 | tr '\t\r\n' '   ' | sed -E -e 's/([Bb]earer[[:space:]]+)[^[:space:]]+/\1[REDACTED]/g' -e 's/((access_token|refresh_token|client_secret|tempauth|password)"?[[:space:]]*[=:][[:space:]]*"?)[^"[:space:]&,}]+/\1[REDACTED]/Ig' | cut -c1-240)
     reason=${reason:-"脚本退出码 $rc"}
 elif grep -Eiq '已有 .*运行.*跳过|已有.*运行，跳过' "$run_log"; then
     status="被锁跳过"; reason="检测到已有同类任务运行"
@@ -21744,7 +21744,9 @@ EOF
 crontab_sync_write_run_tools() { crontab_sync_write_runner "$(crontab_sync_runner_file)"; }
 
 crontab_sync_log_sanitize() {
-	sed -E 's/(access_token|refresh_token|client_secret|Bearer|tempauth|password)[=:][^[:space:]&]*/\1=[REDACTED]/Ig' "$1"
+	sed -E \
+		-e 's/([Bb]earer[[:space:]]+)[^[:space:]]+/\1[REDACTED]/g' \
+		-e 's/((access_token|refresh_token|client_secret|tempauth|password)"?[[:space:]]*[=:][[:space:]]*"?)[^"[:space:]&,}]+/\1[REDACTED]/Ig' "$1"
 }
 
 crontab_sync_log_records() {
@@ -21777,7 +21779,7 @@ crontab_sync_log_copy() {
 	local log="$1" tmp
 	[ -f "$log" ] || return 1; tmp=$(mktemp) || return 1
 	crontab_sync_log_sanitize "$log" > "$tmp"
-	if command -v cpcat >/dev/null 2>&1; then cpcat "$tmp" >/dev/null 2>&1 || true; else printf '\033]52;c;%s\a' "$(base64 < "$tmp" | tr -d '\n')"; fi
+	if command -v cpcat >/dev/null 2>&1; then cpcat "$tmp" || { rm -f "$tmp"; return 1; }; else printf '\033]52;c;%s\a' "$(base64 < "$tmp" | tr -d '\n')"; fi
 	rm -f "$tmp"; echo "已发送到当前终端剪贴板（需要 SSH/终端支持 OSC 52）"
 }
 
